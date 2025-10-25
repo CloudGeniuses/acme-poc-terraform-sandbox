@@ -1,85 +1,95 @@
-ACME POC Terraform Sandbox
-Overview
+ACME POC PHASE 1–3 SPEC SHEET
+Phase 1: Preparation & Environment Setup
+Component	Details	Notes
+Terraform Cloud Workspace	acme-poc-sandbox	Remote state management
+Provider	AWS (us-west-2)	PoC preferred region
+Terraform Variables	project_name="acme-poc", environment="sandbox", name_prefix="acme-poc"	Naming consistency
+Secrets & Keys	Stored in Terraform Cloud workspace	Avoid hardcoded AWS credentials
+Purpose	Foundation for all automation	No dependencies
+Phase 2: Network Foundation (VPCs & Subnets)
+VPCs
+VPC Name	CIDR	Purpose
+acme-poc-mgmt-vpc	10.0.0.0/24	Management/Bastion
+acme-poc-fw-vpc	10.0.1.0/24	Palo Alto NVA / firewall
+acme-poc-app-vpc	10.0.2.0/24	Application (NGINX PoC)
+Subnets
+VPC	Subnet Name	CIDR	Type	Purpose
+mgmt-vpc	mgmt-public-1	10.0.0.0/28	Public	Bastion AZ-A
+mgmt-vpc	mgmt-public-2	10.0.0.16/28	Public	Bastion AZ-B
+mgmt-vpc	mgmt-private-1	10.0.0.32/28	Private	Internal Mgmt AZ-A
+mgmt-vpc	mgmt-private-2	10.0.0.48/28	Private	Internal Mgmt AZ-B
+fw-vpc	fw-untrust-1	10.0.1.0/28	Public	Internet-facing NVA AZ-A
+fw-vpc	fw-untrust-2	10.0.1.16/28	Public	Internet-facing NVA AZ-B
+fw-vpc	fw-trust-1	10.0.1.32/28	Private	East-West traffic AZ-A
+fw-vpc	fw-trust-2	10.0.1.48/28	Private	East-West traffic AZ-B
+fw-vpc	fw-mgmt-1	10.0.1.64/28	Private	NVA management AZ-A
+fw-vpc	fw-mgmt-2	10.0.1.80/28	Private	NVA management AZ-B
+app-vpc	app-private-1	10.0.2.0/28	Private	NGINX AZ-A
+app-vpc	app-private-2	10.0.2.16/28	Private	NGINX AZ-B
+Internet Gateways (IGW)
+VPC	IGW Name	Purpose
+mgmt-vpc	mgmt-igw	Bastion public access
+fw-vpc	fw-igw	NVA untrust internet access
+Route Tables
+Mgmt VPC
+Route Table	Subnets	Routes
+mgmt-public-rt	mgmt-public-1/2	0.0.0.0/0 → IGW (mgmt-igw)
+mgmt-private-rt	mgmt-private-1/2	0.0.0.0/0 → TGW (placeholder)
+FW VPC
+Route Table	Subnets	Routes
+fw-untrust-rt	fw-untrust-1/2	0.0.0.0/0 → IGW (fw-igw)
+fw-trust-rt	fw-trust-1/2	0.0.0.0/0 → TGW
+fw-mgmt-rt	fw-mgmt-1/2	0.0.0.0/0 → TGW
+App VPC
+Route Table	Subnets	Routes
+app-private-rt	app-private-1/2	0.0.0.0/0 → TGW
+VPC Flow Logs
 
-This repository contains Terraform configurations to deploy the ACME proof-of-concept (POC) sandbox environment on AWS. It implements a secure, highly available, and audit-compliant network architecture with:
+Enabled for all VPCs → CloudWatch Logs or S3.
 
-Management, Firewall/NVA, and Application VPCs
+Ensures audit and compliance readiness.
 
-Multi-AZ subnets for high availability
+Phase 3: Transit Gateway & Routing
+Transit Gateway (TGW)
+Component	Detail	Purpose
+TGW Name	acme-poc-tgw	Central hub for inter-VPC and internet routing
+DNS Support	Enabled	Resolves VPC hostnames
+Route Propagation	Enabled	Auto-propagates attached VPC CIDRs
+TGW Attachments
+VPC	Attachment Name	Purpose
+mgmt-vpc	mgmt-tgw-attach	East-West + management traffic
+fw-vpc	fw-tgw-attach	North-South traffic via NVA
+app-vpc	app-tgw-attach	East-West routing to app servers
+TGW Route Table
+Destination	Target	Purpose
+10.0.0.0/24	mgmt-tgw-attach	Reach management VPC
+10.0.1.0/24	fw-tgw-attach	Reach FW VPC
+10.0.2.0/24	app-tgw-attach	Reach App VPC
+0.0.0.0/0	fw-tgw-attach	Internet-bound traffic through NVA
 
-Transit Gateway (TGW) for centralized routing (East-West and North-South traffic)
+Propagation: Each VPC propagates its CIDR to TGW route table automatically.
 
-Internet access via NVAs
+Private Subnet Route Updates
+VPC	Private RT	Routes
+mgmt-vpc	mgmt-private-rt	0.0.0.0/0 → TGW
+fw-vpc	fw-trust-rt	0.0.0.0/0 → TGW
+app-vpc	app-private-rt	0.0.0.0/0 → TGW
+Security Considerations
 
-VPC Flow Logs for auditing and compliance
+Audit-compliant: All private subnets deny-by-default; logs enabled.
 
-Terraform Cloud integration for remote state and secure variable management
+Bastion: SSH only from office VPN.
 
-Architecture Diagram
+FW/NVA: Ready for policy enforcement.
 
-(Add diagram showing VPCs, subnets, TGW, route tables, and IGWs. Use AWS icons or draw.io)
+East-West & North-South: All traffic flows through TGW → FW, ready for inspection.
 
-Prerequisites
+✅ Summary:
 
-AWS account with required permissions
+Everything for Phase 1–3 is fully defined.
 
-Terraform Cloud account with workspace: acme-poc-sandbox
+All route tables, TGW attachments, and propagations are in place.
 
-GitHub repository connected to Terraform Cloud workspace (VCS integration)
+IGWs and private/public subnet separation are correct.
 
-Terraform Cloud workspace variables configured:
-
-project_name
-
-environment
-
-name_prefix
-
-Optional: AWS CLI for manual validation
-
-Deployment Instructions (Remote-Only Workflow)
-
-Push changes to the repository branch connected to Terraform Cloud.
-
-Terraform Cloud automatically detects the changes via VCS integration.
-
-Terraform Cloud executes Plan and Apply remotely.
-
-Monitor execution and review logs in the Terraform Cloud workspace UI.
-
-Confirm resource deployment and routing in AWS console.
-
-Note: No Terraform CLI commands are required for remote-only workflow.
-
-Components Deployed
-Component	Purpose
-mgmt-vpc	Management & bastion hosts
-fw-vpc	Firewall / NVA deployment
-app-vpc	Application workloads
-Subnets	Multi-AZ for HA
-IGWs	Internet access for public subnets
-Route Tables	Routing via TGW & placeholders for IGW/TGW
-Transit Gateway	Central hub for East-West/North-South traffic
-VPC Flow Logs	Security auditing & compliance
-Terraform Variables
-
-Variables are managed in Terraform Cloud and referenced in code:
-
-variable "project_name" {}
-variable "environment" {}
-variable "name_prefix" {}
-
-
-Sensitive variables (e.g., secrets, API keys) are stored securely in Terraform Cloud.
-
-Audit & Compliance Notes
-
-Flow logs enabled for all VPCs
-
-Private subnets not exposed to IGW
-
-Multi-AZ deployment ensures HA
-
-All Terraform changes logged in Terraform Cloud
-
-Naming conventions standardized for easy resource tracking
+This setup is audit-ready, AWS best-practice compliant, and aligned with project requirements.
