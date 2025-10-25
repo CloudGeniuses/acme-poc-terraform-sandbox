@@ -20,9 +20,9 @@ variable "name_prefix" {
   type        = string
 }
 
-# Phase-2/TGW handoff: leave empty in Phase 2; set in Phase 3
+# If you want to BYO TGW, set this; otherwise we'll create one in Phase 3 and use it.
 variable "tgw_id" {
-  description = "Transit Gateway ID to target default routes. Leave empty in Phase 2."
+  description = "Transit Gateway ID to target default routes. Leave empty to create a new TGW."
   type        = string
   default     = ""
 }
@@ -227,7 +227,126 @@ resource "aws_internet_gateway" "fw_igw" {
 }
 
 ########################
-# Phase 2: Route Tables & Routes
+# Phase 3: Transit Gateway & Inspection
+########################
+
+# Create a TGW if not provided via var.tgw_id; we will always reference local.effective_tgw_id below.
+resource "aws_ec2_transit_gateway" "poc_tgw" {
+  count                           = var.tgw_id == "" ? 1 : 0
+  description                     = "ACME POC TGW"
+  default_route_table_association = "disable"
+  default_route_table_propagation = "disable"
+  dns_support                     = "enable"
+  vpn_ecmp_support                = "enable"
+  tags = {
+    Name        = "${var.name_prefix}-tgw"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+# Pick user-provided TGW or the one we just created.
+locals {
+  effective_tgw_id = var.tgw_id != "" ? var.tgw_id : (length(aws_ec2_transit_gateway.poc_tgw) > 0 ? aws_ec2_transit_gateway.poc_tgw[0].id : "")
+}
+
+# VPC Attachments (Mgmt/App/FW-trust)
+resource "aws_ec2_transit_gateway_vpc_attachment" "att_mgmt" {
+  transit_gateway_id = local.effective_tgw_id
+  vpc_id             = aws_vpc.mgmt_vpc.id
+  subnet_ids         = [aws_subnet.mgmt_private_1.id, aws_subnet.mgmt_private_2.id]
+  dns_support        = "enable"
+  tags = {
+    Name        = "${var.name_prefix}-tgw-att-mgmt"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+resource "aws_ec2_transit_gateway_vpc_attachment" "att_app" {
+  transit_gateway_id = local.effective_tgw_id
+  vpc_id             = aws_vpc.app_vpc.id
+  subnet_ids         = [aws_subnet.app_private_1.id, aws_subnet.app_private_2.id]
+  dns_support        = "enable"
+  tags = {
+    Name        = "${var.name_prefix}-tgw-att-app"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+# Firewall VPC attachment — Appliance Mode ENABLED
+resource "aws_ec2_transit_gateway_vpc_attachment" "att_fw" {
+  transit_gateway_id     = local.effective_tgw_id
+  vpc_id                 = aws_vpc.fw_vpc.id
+  subnet_ids             = [aws_subnet.fw_trust_1.id, aws_subnet.fw_trust_2.id]
+  dns_support            = "enable"
+  appliance_mode_support = "enable"
+  tags = {
+    Name        = "${var.name_prefix}-tgw-att-fw"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+# TGW Route Tables
+resource "aws_ec2_transit_gateway_route_table" "rt_spokes" {
+  transit_gateway_id = local.effective_tgw_id
+  tags = {
+    Name        = "${var.name_prefix}-tgw-rt-spokes"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+resource "aws_ec2_transit_gateway_route_table" "rt_firewall" {
+  transit_gateway_id = local.effective_tgw_id
+  tags = {
+    Name        = "${var.name_prefix}-tgw-rt-firewall"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+# Associations: spokes (mgmt/app) → spoke RT ; firewall → firewall RT
+resource "aws_ec2_transit_gateway_route_table_association" "assoc_mgmt" {
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.att_mgmt.id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.rt_spokes.id
+}
+
+resource "aws_ec2_transit_gateway_route_table_association" "assoc_app" {
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.att_app.id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.rt_spokes.id
+}
+
+resource "aws_ec2_transit_gateway_route_table_association" "assoc_fw" {
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.att_fw.id
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.rt_firewall.id
+}
+
+# TGW Routes
+# Spoke RT: send default to firewall
+resource "aws_ec2_transit_gateway_route" "spokes_default_to_fw" {
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.rt_spokes.id
+  destination_cidr_block         = "0.0.0.0/0"
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.att_fw.id
+}
+
+# Firewall RT: return routes to spokes
+resource "aws_ec2_transit_gateway_route" "fw_to_mgmt" {
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.rt_firewall.id
+  destination_cidr_block         = "10.0.0.0/24"
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.att_mgmt.id
+}
+
+resource "aws_ec2_transit_gateway_route" "fw_to_app" {
+  transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.rt_firewall.id
+  destination_cidr_block         = "10.0.2.0/24"
+  transit_gateway_attachment_id  = aws_ec2_transit_gateway_vpc_attachment.att_app.id
+}
+
+########################
+# Phase 2: Route Tables & Routes (VPC side)
 ########################
 # Mgmt public → IGW
 resource "aws_route_table" "mgmt_public_rt" {
@@ -255,7 +374,7 @@ resource "aws_route_table_association" "mgmt_public_2_assoc" {
   route_table_id = aws_route_table.mgmt_public_rt.id
 }
 
-# Mgmt private → TGW (created only when tgw_id is provided)
+# Mgmt private → TGW
 resource "aws_route_table" "mgmt_private_rt" {
   vpc_id = aws_vpc.mgmt_vpc.id
   tags = {
@@ -266,10 +385,9 @@ resource "aws_route_table" "mgmt_private_rt" {
 }
 
 resource "aws_route" "mgmt_private_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
   route_table_id         = aws_route_table.mgmt_private_rt.id
   destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
+  transit_gateway_id     = local.effective_tgw_id
 }
 
 resource "aws_route_table_association" "mgmt_private_1_assoc" {
@@ -308,7 +426,7 @@ resource "aws_route_table_association" "fw_untrust_2_assoc" {
   route_table_id = aws_route_table.fw_untrust_rt.id
 }
 
-# FW VPC: Trust + Mgmt (private) → TGW (only when set)
+# FW VPC: Trust + Mgmt (private) → TGW
 resource "aws_route_table" "fw_trust_rt" {
   vpc_id = aws_vpc.fw_vpc.id
   tags = {
@@ -319,10 +437,9 @@ resource "aws_route_table" "fw_trust_rt" {
 }
 
 resource "aws_route" "fw_trust_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
   route_table_id         = aws_route_table.fw_trust_rt.id
   destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
+  transit_gateway_id     = local.effective_tgw_id
 }
 
 resource "aws_route_table_association" "fw_trust_1_assoc" {
@@ -345,10 +462,9 @@ resource "aws_route_table" "fw_mgmt_rt" {
 }
 
 resource "aws_route" "fw_mgmt_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
   route_table_id         = aws_route_table.fw_mgmt_rt.id
   destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
+  transit_gateway_id     = local.effective_tgw_id
 }
 
 resource "aws_route_table_association" "fw_mgmt_1_assoc" {
@@ -361,7 +477,7 @@ resource "aws_route_table_association" "fw_mgmt_2_assoc" {
   route_table_id = aws_route_table.fw_mgmt_rt.id
 }
 
-# APP VPC: Private → TGW (only when set)
+# APP VPC: Private → TGW
 resource "aws_route_table" "app_private_rt" {
   vpc_id = aws_vpc.app_vpc.id
   tags = {
@@ -372,10 +488,9 @@ resource "aws_route_table" "app_private_rt" {
 }
 
 resource "aws_route" "app_private_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
   route_table_id         = aws_route_table.app_private_rt.id
   destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
+  transit_gateway_id     = local.effective_tgw_id
 }
 
 resource "aws_route_table_association" "app_private_1_assoc" {
@@ -391,6 +506,18 @@ resource "aws_route_table_association" "app_private_2_assoc" {
 ########################
 # Outputs
 ########################
+output "tgw_id" {
+  value = local.effective_tgw_id
+}
+
+output "tgw_attachments" {
+  value = {
+    mgmt = aws_ec2_transit_gateway_vpc_attachment.att_mgmt.id
+    app  = aws_ec2_transit_gateway_vpc_attachment.att_app.id
+    fw   = aws_ec2_transit_gateway_vpc_attachment.att_fw.id
+  }
+}
+
 output "route_tables" {
   value = {
     mgmt_public = {
