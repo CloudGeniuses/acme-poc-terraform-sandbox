@@ -217,7 +217,6 @@ resource "aws_instance" "vmseries" {
   vpc_security_group_ids = [aws_security_group.fw_mgmt_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.fw_ssm_profile.name
   user_data_base64       = base64encode(local.fw_user_data)
-  associate_public_ip_address = false
 
   # Attach dataplane ENIs
   network_interface {
