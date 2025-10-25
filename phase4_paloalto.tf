@@ -1,5 +1,5 @@
 ########################################
-# Phase 4: Palo Alto VM-Series (PAYG) — 3-NIC, per-AZ
+# Phase 4: Palo Alto VM-Series (PAYG) — Multi-AZ Deployment
 ########################################
 
 # ---- Variables ----
@@ -20,13 +20,13 @@ variable "pan_key_name" {
 }
 
 variable "admin_cidr" {
-  description = "CIDR allowed to mgmt (HTTPS/SSH)"
+  description = "CIDR allowed to management (HTTPS/SSH)"
   type        = string
   default     = "10.0.0.0/8"
 }
 
 variable "enable_bootstrap" {
-  description = "Use S3 bootstrap?"
+  description = "Use S3 bootstrap configuration?"
   type        = bool
   default     = false
 }
@@ -37,7 +37,9 @@ variable "bootstrap_s3_bucket" {
   default     = ""
 }
 
-# ---- Security Groups (fw_vpc) ----
+########################################
+# Security Groups — Firewall VPC
+########################################
 resource "aws_security_group" "fw_mgmt_sg" {
   name        = "${var.name_prefix}-fw-mgmt-sg"
   description = "Mgmt access to VM-Series"
@@ -50,6 +52,7 @@ resource "aws_security_group" "fw_mgmt_sg" {
     protocol    = "tcp"
     cidr_blocks = [var.admin_cidr]
   }
+
   ingress {
     description = "HTTPS"
     from_port   = 443
@@ -57,6 +60,7 @@ resource "aws_security_group" "fw_mgmt_sg" {
     protocol    = "tcp"
     cidr_blocks = [var.admin_cidr]
   }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -76,7 +80,6 @@ resource "aws_security_group" "fw_untrust_sg" {
   description = "Untrust dataplane ENI"
   vpc_id      = aws_vpc.fw_vpc.id
 
-  # keep inbound closed by default
   egress {
     from_port   = 0
     to_port     = 0
@@ -102,6 +105,7 @@ resource "aws_security_group" "fw_trust_sg" {
     protocol    = "-1"
     cidr_blocks = ["10.0.0.0/24", "10.0.2.0/24"]
   }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -116,7 +120,9 @@ resource "aws_security_group" "fw_trust_sg" {
   }
 }
 
-# ---- Optional SSM (recommended) ----
+########################################
+# IAM Role for SSM (optional but recommended)
+########################################
 resource "aws_iam_role" "fw_ssm_role" {
   name               = "${var.name_prefix}-fw-ssm-role"
   assume_role_policy = jsonencode({
@@ -127,6 +133,7 @@ resource "aws_iam_role" "fw_ssm_role" {
       Action    = "sts:AssumeRole"
     }]
   })
+
   tags = {
     Name        = "${var.name_prefix}-fw-ssm-role"
     Project     = var.project_name
@@ -144,23 +151,27 @@ resource "aws_iam_instance_profile" "fw_ssm_profile" {
   role = aws_iam_role.fw_ssm_role.name
 }
 
-# ---- Per-AZ mapping ----
+########################################
+# Local Mappings
+########################################
 locals {
   fw_pairs = [
     { mgmt = aws_subnet.fw_mgmt_1.id,  untrust = aws_subnet.fw_untrust_1.id, trust = aws_subnet.fw_trust_1.id },
     { mgmt = aws_subnet.fw_mgmt_2.id,  untrust = aws_subnet.fw_untrust_2.id, trust = aws_subnet.fw_trust_2.id }
   ]
 
-  # simple conditional string (avoid heredoc ternary issue)
   fw_user_data = var.enable_bootstrap ? "vmseries-bootstrap-aws-s3bucket=${var.bootstrap_s3_bucket}" : ""
 }
 
-# ---- Dataplane ENIs + EIPs ----
+########################################
+# ENIs & EIPs
+########################################
 resource "aws_network_interface" "fw_untrust_eni" {
   count             = length(local.fw_pairs)
   subnet_id         = local.fw_pairs[count.index].untrust
   security_groups   = [aws_security_group.fw_untrust_sg.id]
   source_dest_check = false
+
   tags = {
     Name        = "${var.name_prefix}-fw-untrust-eni-${count.index}"
     Project     = var.project_name
@@ -172,6 +183,7 @@ resource "aws_eip" "fw_untrust_eip" {
   count             = length(local.fw_pairs)
   domain            = "vpc"
   network_interface = aws_network_interface.fw_untrust_eni[count.index].id
+
   tags = {
     Name        = "${var.name_prefix}-fw-untrust-eip-${count.index}"
     Project     = var.project_name
@@ -184,6 +196,7 @@ resource "aws_network_interface" "fw_trust_eni" {
   subnet_id         = local.fw_pairs[count.index].trust
   security_groups   = [aws_security_group.fw_trust_sg.id]
   source_dest_check = false
+
   tags = {
     Name        = "${var.name_prefix}-fw-trust-eni-${count.index}"
     Project     = var.project_name
@@ -191,21 +204,22 @@ resource "aws_network_interface" "fw_trust_eni" {
   }
 }
 
-# ---- VM-Series instances (one per AZ) ----
+########################################
+# VM-Series Instances
+########################################
 resource "aws_instance" "vmseries" {
   count         = length(local.fw_pairs)
   ami           = var.pan_ami_id
   instance_type = var.pan_instance_type
   key_name      = var.pan_key_name
 
-  # Primary NIC (eth0) — mgmt
   subnet_id              = local.fw_pairs[count.index].mgmt
   vpc_security_group_ids = [aws_security_group.fw_mgmt_sg.id]
   iam_instance_profile   = aws_iam_instance_profile.fw_ssm_profile.name
-  user_data              = local.fw_user_data
+  user_data_base64       = base64encode(local.fw_user_data)
   associate_public_ip_address = false
 
-  # Attach dataplane ENIs: eth1=untrust, eth2=trust
+  # Attach dataplane ENIs
   network_interface {
     network_interface_id = aws_network_interface.fw_untrust_eni[count.index].id
     device_index         = 1
@@ -226,7 +240,9 @@ resource "aws_instance" "vmseries" {
   }
 }
 
-# ---- Outputs ----
+########################################
+# Outputs
+########################################
 output "vmseries_mgmt_private_ips" {
   value = aws_instance.vmseries[*].private_ip
 }
