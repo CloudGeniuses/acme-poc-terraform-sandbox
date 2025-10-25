@@ -80,6 +80,7 @@ resource "aws_security_group" "fw_untrust_sg" {
   description = "Untrust dataplane ENI"
   vpc_id      = aws_vpc.fw_vpc.id
 
+  # keep inbound closed by default
   egress {
     from_port   = 0
     to_port     = 0
@@ -166,6 +167,22 @@ locals {
 ########################################
 # ENIs & EIPs
 ########################################
+
+# MGMT ENI (primary eth0)
+resource "aws_network_interface" "fw_mgmt_eni" {
+  count           = length(local.fw_pairs)
+  subnet_id       = local.fw_pairs[count.index].mgmt
+  security_groups = [aws_security_group.fw_mgmt_sg.id]
+  # source_dest_check default (true) is fine for management
+
+  tags = {
+    Name        = "${var.name_prefix}-fw-mgmt-eni-${count.index}"
+    Project     = var.project_name
+    Environment = var.environment
+  }
+}
+
+# UNTRUST ENI (eth1) + EIP
 resource "aws_network_interface" "fw_untrust_eni" {
   count             = length(local.fw_pairs)
   subnet_id         = local.fw_pairs[count.index].untrust
@@ -191,6 +208,7 @@ resource "aws_eip" "fw_untrust_eip" {
   }
 }
 
+# TRUST ENI (eth2)
 resource "aws_network_interface" "fw_trust_eni" {
   count             = length(local.fw_pairs)
   subnet_id         = local.fw_pairs[count.index].trust
@@ -205,7 +223,7 @@ resource "aws_network_interface" "fw_trust_eni" {
 }
 
 ########################################
-# VM-Series Instances
+# VM-Series Instances (attach all ENIs)
 ########################################
 resource "aws_instance" "vmseries" {
   count         = length(local.fw_pairs)
@@ -213,12 +231,15 @@ resource "aws_instance" "vmseries" {
   instance_type = var.pan_instance_type
   key_name      = var.pan_key_name
 
-  subnet_id              = local.fw_pairs[count.index].mgmt
-  vpc_security_group_ids = [aws_security_group.fw_mgmt_sg.id]
-  iam_instance_profile   = aws_iam_instance_profile.fw_ssm_profile.name
-  user_data_base64       = base64encode(local.fw_user_data)
+  iam_instance_profile = aws_iam_instance_profile.fw_ssm_profile.name
+  user_data_base64     = base64encode(local.fw_user_data)
 
-  # Attach dataplane ENIs
+  # Attach ALL interfaces via network_interface blocks
+  # eth0 = mgmt, eth1 = untrust, eth2 = trust
+  network_interface {
+    network_interface_id = aws_network_interface.fw_mgmt_eni[count.index].id
+    device_index         = 0
+  }
   network_interface {
     network_interface_id = aws_network_interface.fw_untrust_eni[count.index].id
     device_index         = 1
