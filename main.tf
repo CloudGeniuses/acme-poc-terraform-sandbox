@@ -30,7 +30,6 @@ variable "tgw_id" {
 ########################
 # Phase 2: VPCs
 ########################
-
 resource "aws_vpc" "mgmt_vpc" {
   cidr_block           = "10.0.0.0/24"
   enable_dns_support   = true
@@ -67,141 +66,96 @@ resource "aws_vpc" "app_vpc" {
 ########################
 # Phase 2: Subnets
 ########################
-
-# Management VPC Subnets
-resource "aws_subnet" "mgmt_public_1" {
+# Mgmt VPC
+resource "aws_subnet" "mgmt_public" {
+  for_each = {
+    "1" = "10.0.0.0/28"
+    "2" = "10.0.0.16/28"
+  }
   vpc_id                  = aws_vpc.mgmt_vpc.id
-  cidr_block              = "10.0.0.0/28"
-  availability_zone       = "us-west-2a"
+  cidr_block              = each.value
+  availability_zone       = "us-west-2${each.key}"
   map_public_ip_on_launch = true
   tags = {
-    Name        = "${var.name_prefix}-mgmt-public-1"
+    Name        = "${var.name_prefix}-mgmt-public-${each.key}"
     Project     = var.project_name
     Environment = var.environment
   }
 }
 
-resource "aws_subnet" "mgmt_public_2" {
-  vpc_id                  = aws_vpc.mgmt_vpc.id
-  cidr_block              = "10.0.0.16/28"
-  availability_zone       = "us-west-2b"
-  map_public_ip_on_launch = true
-  tags = {
-    Name        = "${var.name_prefix}-mgmt-public-2"
-    Project     = var.project_name
-    Environment = var.environment
+resource "aws_subnet" "mgmt_private" {
+  for_each = {
+    "1" = "10.0.0.32/28"
+    "2" = "10.0.0.48/28"
   }
-}
-
-resource "aws_subnet" "mgmt_private_1" {
   vpc_id            = aws_vpc.mgmt_vpc.id
-  cidr_block        = "10.0.0.32/28"
-  availability_zone = "us-west-2a"
+  cidr_block        = each.value
+  availability_zone = "us-west-2${each.key}"
   tags = {
-    Name        = "${var.name_prefix}-mgmt-private-1"
+    Name        = "${var.name_prefix}-mgmt-private-${each.key}"
     Project     = var.project_name
     Environment = var.environment
   }
 }
 
-resource "aws_subnet" "mgmt_private_2" {
-  vpc_id            = aws_vpc.mgmt_vpc.id
-  cidr_block        = "10.0.0.48/28"
-  availability_zone = "us-west-2b"
-  tags = {
-    Name        = "${var.name_prefix}-mgmt-private-2"
-    Project     = var.project_name
-    Environment = var.environment
+# FW VPC
+resource "aws_subnet" "fw_untrust" {
+  for_each = {
+    "1" = "10.0.1.0/28"
+    "2" = "10.0.1.16/28"
   }
-}
-
-# Firewall VPC Subnets
-resource "aws_subnet" "fw_untrust_1" {
   vpc_id                  = aws_vpc.fw_vpc.id
-  cidr_block              = "10.0.1.0/28"
-  availability_zone       = "us-west-2a"
+  cidr_block              = each.value
+  availability_zone       = "us-west-2${each.key}"
   map_public_ip_on_launch = true
   tags = {
-    Name        = "${var.name_prefix}-fw-untrust-1"
+    Name        = "${var.name_prefix}-fw-untrust-${each.key}"
     Project     = var.project_name
     Environment = var.environment
   }
 }
 
-resource "aws_subnet" "fw_untrust_2" {
-  vpc_id                  = aws_vpc.fw_vpc.id
-  cidr_block              = "10.0.1.16/28"
-  availability_zone       = "us-west-2b"
-  map_public_ip_on_launch = true
-  tags = {
-    Name        = "${var.name_prefix}-fw-untrust-2"
-    Project     = var.project_name
-    Environment = var.environment
+resource "aws_subnet" "fw_trust" {
+  for_each = {
+    "1" = "10.0.1.32/28"
+    "2" = "10.0.1.48/28"
   }
-}
-
-resource "aws_subnet" "fw_trust_1" {
   vpc_id            = aws_vpc.fw_vpc.id
-  cidr_block        = "10.0.1.32/28"
-  availability_zone = "us-west-2a"
+  cidr_block        = each.value
+  availability_zone = "us-west-2${each.key}"
   tags = {
-    Name        = "${var.name_prefix}-fw-trust-1"
+    Name        = "${var.name_prefix}-fw-trust-${each.key}"
     Project     = var.project_name
     Environment = var.environment
   }
 }
 
-resource "aws_subnet" "fw_trust_2" {
+resource "aws_subnet" "fw_mgmt" {
+  for_each = {
+    "1" = "10.0.1.64/28"
+    "2" = "10.0.1.80/28"
+  }
   vpc_id            = aws_vpc.fw_vpc.id
-  cidr_block        = "10.0.1.48/28"
-  availability_zone = "us-west-2b"
+  cidr_block        = each.value
+  availability_zone = "us-west-2${each.key}"
   tags = {
-    Name        = "${var.name_prefix}-fw-trust-2"
+    Name        = "${var.name_prefix}-fw-mgmt-${each.key}"
     Project     = var.project_name
     Environment = var.environment
   }
 }
 
-resource "aws_subnet" "fw_mgmt_1" {
-  vpc_id            = aws_vpc.fw_vpc.id
-  cidr_block        = "10.0.1.64/28"
-  availability_zone = "us-west-2a"
-  tags = {
-    Name        = "${var.name_prefix}-fw-mgmt-1"
-    Project     = var.project_name
-    Environment = var.environment
+# App VPC
+resource "aws_subnet" "app_private" {
+  for_each = {
+    "1" = "10.0.2.0/28"
+    "2" = "10.0.2.16/28"
   }
-}
-
-resource "aws_subnet" "fw_mgmt_2" {
-  vpc_id            = aws_vpc.fw_vpc.id
-  cidr_block        = "10.0.1.80/28"
-  availability_zone = "us-west-2b"
-  tags = {
-    Name        = "${var.name_prefix}-fw-mgmt-2"
-    Project     = var.project_name
-    Environment = var.environment
-  }
-}
-
-# Application VPC Subnets
-resource "aws_subnet" "app_private_1" {
   vpc_id            = aws_vpc.app_vpc.id
-  cidr_block        = "10.0.2.0/28"
-  availability_zone = "us-west-2a"
+  cidr_block        = each.value
+  availability_zone = "us-west-2${each.key}"
   tags = {
-    Name        = "${var.name_prefix}-app-private-1"
-    Project     = var.project_name
-    Environment = var.environment
-  }
-}
-
-resource "aws_subnet" "app_private_2" {
-  vpc_id            = aws_vpc.app_vpc.id
-  cidr_block        = "10.0.2.16/28"
-  availability_zone = "us-west-2b"
-  tags = {
-    Name        = "${var.name_prefix}-app-private-2"
+    Name        = "${var.name_prefix}-app-private-${each.key}"
     Project     = var.project_name
     Environment = var.environment
   }
@@ -210,7 +164,6 @@ resource "aws_subnet" "app_private_2" {
 ########################
 # Phase 2: Internet Gateways
 ########################
-
 resource "aws_internet_gateway" "mgmt_igw" {
   vpc_id = aws_vpc.mgmt_vpc.id
   tags = {
@@ -230,156 +183,127 @@ resource "aws_internet_gateway" "fw_igw" {
 }
 
 ########################
-# Phase 2: Route Tables & Associations
+# Phase 2: Route Tables
 ########################
+# Function to conditionally add TGW route
+locals {
+  add_tgw = var.tgw_id != ""
+}
 
-# Mgmt public → IGW
+# Mgmt
 resource "aws_route_table" "mgmt_public_rt" {
   vpc_id = aws_vpc.mgmt_vpc.id
-  tags = {
-    Name        = "${var.name_prefix}-mgmt-public-rt"
-    Project     = var.project_name
-    Environment = var.environment
-  }
-
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.mgmt_igw.id
   }
+  tags = { Name = "${var.name_prefix}-mgmt-public-rt" }
 }
 
-resource "aws_route_table_association" "mgmt_public_1_assoc" {
-  subnet_id      = aws_subnet.mgmt_public_1.id
-  route_table_id = aws_route_table.mgmt_public_rt.id
-}
-resource "aws_route_table_association" "mgmt_public_2_assoc" {
-  subnet_id      = aws_subnet.mgmt_public_2.id
-  route_table_id = aws_route_table.mgmt_public_rt.id
-}
-
-# Mgmt private → TGW (route added only if tgw_id provided)
 resource "aws_route_table" "mgmt_private_rt" {
   vpc_id = aws_vpc.mgmt_vpc.id
-  tags = {
-    Name        = "${var.name_prefix}-mgmt-private-rt"
-    Project     = var.project_name
-    Environment = var.environment
+  dynamic "route" {
+    for_each = local.add_tgw ? [1] : []
+    content {
+      destination_cidr_block = "0.0.0.0/0"
+      transit_gateway_id     = var.tgw_id
+    }
   }
-}
-resource "aws_route" "mgmt_private_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
-  route_table_id         = aws_route_table.mgmt_private_rt.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
-}
-resource "aws_route_table_association" "mgmt_private_1_assoc" {
-  subnet_id      = aws_subnet.mgmt_private_1.id
-  route_table_id = aws_route_table.mgmt_private_rt.id
-}
-resource "aws_route_table_association" "mgmt_private_2_assoc" {
-  subnet_id      = aws_subnet.mgmt_private_2.id
-  route_table_id = aws_route_table.mgmt_private_rt.id
+  tags = { Name = "${var.name_prefix}-mgmt-private-rt" }
 }
 
-# FW untrust → IGW
+# FW
 resource "aws_route_table" "fw_untrust_rt" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name        = "${var.name_prefix}-fw-untrust-rt"
-    Project     = var.project_name
-    Environment = var.environment
-  }
-
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.fw_igw.id
   }
-}
-resource "aws_route_table_association" "fw_untrust_1_assoc" {
-  subnet_id      = aws_subnet.fw_untrust_1.id
-  route_table_id = aws_route_table.fw_untrust_rt.id
-}
-resource "aws_route_table_association" "fw_untrust_2_assoc" {
-  subnet_id      = aws_subnet.fw_untrust_2.id
-  route_table_id = aws_route_table.fw_untrust_rt.id
+  tags = { Name = "${var.name_prefix}-fw-untrust-rt" }
 }
 
-# FW trust → TGW
 resource "aws_route_table" "fw_trust_rt" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name        = "${var.name_prefix}-fw-trust-rt"
-    Project     = var.project_name
-    Environment = var.environment
+  dynamic "route" {
+    for_each = local.add_tgw ? [1] : []
+    content {
+      destination_cidr_block = "0.0.0.0/0"
+      transit_gateway_id     = var.tgw_id
+    }
   }
-}
-resource "aws_route" "fw_trust_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
-  route_table_id         = aws_route_table.fw_trust_rt.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
-}
-resource "aws_route_table_association" "fw_trust_1_assoc" {
-  subnet_id      = aws_subnet.fw_trust_1.id
-  route_table_id = aws_route_table.fw_trust_rt.id
-}
-resource "aws_route_table_association" "fw_trust_2_assoc" {
-  subnet_id      = aws_subnet.fw_trust_2.id
-  route_table_id = aws_route_table.fw_trust_rt.id
+  tags = { Name = "${var.name_prefix}-fw-trust-rt" }
 }
 
-# FW mgmt → TGW
 resource "aws_route_table" "fw_mgmt_rt" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name        = "${var.name_prefix}-fw-mgmt-rt"
-    Project     = var.project_name
-    Environment = var.environment
+  dynamic "route" {
+    for_each = local.add_tgw ? [1] : []
+    content {
+      destination_cidr_block = "0.0.0.0/0"
+      transit_gateway_id     = var.tgw_id
+    }
   }
+  tags = { Name = "${var.name_prefix}-fw-mgmt-rt" }
 }
-resource "aws_route" "fw_mgmt_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
-  route_table_id         = aws_route_table.fw_mgmt_rt.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
+
+# App
+resource "aws_route_table" "app_private_rt" {
+  vpc_id = aws_vpc.app_vpc.id
+  dynamic "route" {
+    for_each = local.add_tgw ? [1] : []
+    content {
+      destination_cidr_block = "0.0.0.0/0"
+      transit_gateway_id     = var.tgw_id
+    }
+  }
+  tags = { Name = "${var.name_prefix}-app-private-rt" }
 }
-resource "aws_route_table_association" "fw_mgmt_1_assoc" {
-  subnet_id      = aws_subnet.fw_mgmt_1.id
-  route_table_id = aws_route_table.fw_mgmt_rt.id
+
+########################
+# Phase 2: Route Table Associations
+########################
+# Mgmt
+resource "aws_route_table_association" "mgmt_public_assoc" {
+  for_each = aws_subnet.mgmt_public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.mgmt_public_rt.id
 }
-resource "aws_route_table_association" "fw_mgmt_2_assoc" {
-  subnet_id      = aws_subnet.fw_mgmt_2.id
+
+resource "aws_route_table_association" "mgmt_private_assoc" {
+  for_each = aws_subnet.mgmt_private
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.mgmt_private_rt.id
+}
+
+# FW
+resource "aws_route_table_association" "fw_untrust_assoc" {
+  for_each = aws_subnet.fw_untrust
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.fw_untrust_rt.id
+}
+
+resource "aws_route_table_association" "fw_trust_assoc" {
+  for_each = aws_subnet.fw_trust
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.fw_trust_rt.id
+}
+
+resource "aws_route_table_association" "fw_mgmt_assoc" {
+  for_each = aws_subnet.fw_mgmt
+  subnet_id      = each.value.id
   route_table_id = aws_route_table.fw_mgmt_rt.id
 }
 
-# App private → TGW
-resource "aws_route_table" "app_private_rt" {
-  vpc_id = aws_vpc.app_vpc.id
-  tags = {
-    Name        = "${var.name_prefix}-app-private-rt"
-    Project     = var.project_name
-    Environment = var.environment
-  }
-}
-resource "aws_route" "app_private_default" {
-  count                  = var.tgw_id == "" ? 0 : 1
-  route_table_id         = aws_route_table.app_private_rt.id
-  destination_cidr_block = "0.0.0.0/0"
-  transit_gateway_id     = var.tgw_id
-}
-resource "aws_route_table_association" "app_private_1_assoc" {
-  subnet_id      = aws_subnet.app_private_1.id
-  route_table_id = aws_route_table.app_private_rt.id
-}
-resource "aws_route_table_association" "app_private_2_assoc" {
-  subnet_id      = aws_subnet.app_private_2.id
+# App
+resource "aws_route_table_association" "app_private_assoc" {
+  for_each = aws_subnet.app_private
+  subnet_id      = each.value.id
   route_table_id = aws_route_table.app_private_rt.id
 }
 
 ########################
 # Phase 2: VPC Flow Logs to CloudWatch
 ########################
-
 resource "aws_iam_role" "vpc_flow_logs_role" {
   name = "${var.name_prefix}-vpc-flow-logs-role"
   assume_role_policy = jsonencode({
@@ -390,10 +314,7 @@ resource "aws_iam_role" "vpc_flow_logs_role" {
       Action    = "sts:AssumeRole"
     }]
   })
-  tags = {
-    Project     = var.project_name
-    Environment = var.environment
-  }
+  tags = { Project = var.project_name, Environment = var.environment }
 }
 
 resource "aws_iam_policy" "vpc_flow_logs_policy" {
@@ -402,8 +323,8 @@ resource "aws_iam_policy" "vpc_flow_logs_policy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
-      Action = [
+      Effect   = "Allow"
+      Action   = [
         "logs:CreateLogGroup",
         "logs:CreateLogStream",
         "logs:PutLogEvents",
@@ -420,36 +341,22 @@ resource "aws_iam_role_policy_attachment" "vpc_flow_logs_attach" {
   policy_arn = aws_iam_policy.vpc_flow_logs_policy.arn
 }
 
-resource "aws_cloudwatch_log_group" "mgmt_vpc_flow" {
-  name = "/${var.name_prefix}/mgmt-vpc-flowlogs"
-}
-resource "aws_cloudwatch_log_group" "fw_vpc_flow" {
-  name = "/${var.name_prefix}/fw-vpc-flowlogs"
-}
-resource "aws_cloudwatch_log_group" "app_vpc_flow" {
-  name = "/${var.name_prefix}/app-vpc-flowlogs"
-}
-
-resource "aws_flow_log" "mgmt_vpc" {
-  vpc_id               = aws_vpc.mgmt_vpc.id
-  log_destination_type = "cloud-watch-logs"
-  log_group_name       = aws_cloudwatch_log_group.mgmt_vpc_flow.name
-  iam_role_arn         = aws_iam_role.vpc_flow_logs_role.arn
-  traffic_type         = "ALL"
+# Log Groups
+resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
+  for_each = {
+    "mgmt" = aws_vpc.mgmt_vpc.id
+    "fw"   = aws_vpc.fw_vpc.id
+    "app"  = aws_vpc.app_vpc.id
+  }
+  name = "/${var.name_prefix}/${each.key}-vpc-flowlogs"
 }
 
-resource "aws_flow_log" "fw_vpc" {
-  vpc_id               = aws_vpc.fw_vpc.id
+# Flow Logs
+resource "aws_flow_log" "vpc_flow_logs" {
+  for_each = aws_cloudwatch_log_group.vpc_flow_logs
+  vpc_id               = each.key
   log_destination_type = "cloud-watch-logs"
-  log_group_name       = aws_cloudwatch_log_group.fw_vpc_flow.name
-  iam_role_arn         = aws_iam_role.vpc_flow_logs_role.arn
-  traffic_type         = "ALL"
-}
-
-resource "aws_flow_log" "app_vpc" {
-  vpc_id               = aws_vpc.app_vpc.id
-  log_destination_type = "cloud-watch-logs"
-  log_group_name       = aws_cloudwatch_log_group.app_vpc_flow.name
+  log_group_name       = each.value.name
   iam_role_arn         = aws_iam_role.vpc_flow_logs_role.arn
   traffic_type         = "ALL"
 }
