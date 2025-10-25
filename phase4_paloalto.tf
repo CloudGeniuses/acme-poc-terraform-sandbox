@@ -11,7 +11,8 @@ variable "pan_ami_id" {
 variable "pan_instance_type" {
   description = "VM-Series size"
   type        = string
-  default     = "c5n.xlarge"
+  # c5.xlarge is widely available; you can override to c5n.xlarge later if supported
+  default     = "c5.xlarge"
 }
 
 variable "pan_key_name" {
@@ -80,7 +81,6 @@ resource "aws_security_group" "fw_untrust_sg" {
   description = "Untrust dataplane ENI"
   vpc_id      = aws_vpc.fw_vpc.id
 
-  # keep inbound closed by default
   egress {
     from_port   = 0
     to_port     = 0
@@ -173,7 +173,6 @@ resource "aws_network_interface" "fw_mgmt_eni" {
   count           = length(local.fw_pairs)
   subnet_id       = local.fw_pairs[count.index].mgmt
   security_groups = [aws_security_group.fw_mgmt_sg.id]
-  # source_dest_check default (true) is fine for management
 
   tags = {
     Name        = "${var.name_prefix}-fw-mgmt-eni-${count.index}"
@@ -226,27 +225,16 @@ resource "aws_network_interface" "fw_trust_eni" {
 # VM-Series Instances (attach all ENIs)
 ########################################
 resource "aws_instance" "vmseries" {
-  count         = length(local.fw_pairs)
-  ami           = var.pan_ami_id
-  instance_type = var.pan_instance_type
-  key_name      = var.pan_key_name
-
+  count               = length(local.fw_pairs)
+  ami                 = var.pan_ami_id
+  instance_type       = var.pan_instance_type
+  key_name            = var.pan_key_name
   iam_instance_profile = aws_iam_instance_profile.fw_ssm_profile.name
   user_data_base64     = base64encode(local.fw_user_data)
 
-  # Attach ALL interfaces via network_interface blocks
-  # eth0 = mgmt, eth1 = untrust, eth2 = trust
-  network_interface {
+  # Primary interface (eth0) — mgmt
+  primary_network_interface {
     network_interface_id = aws_network_interface.fw_mgmt_eni[count.index].id
-    device_index         = 0
-  }
-  network_interface {
-    network_interface_id = aws_network_interface.fw_untrust_eni[count.index].id
-    device_index         = 1
-  }
-  network_interface {
-    network_interface_id = aws_network_interface.fw_trust_eni[count.index].id
-    device_index         = 2
   }
 
   lifecycle {
@@ -258,6 +246,21 @@ resource "aws_instance" "vmseries" {
     Project     = var.project_name
     Environment = var.environment
   }
+}
+
+# Attach dataplane ENIs after instance creation (removes deprecation warning)
+resource "aws_network_interface_attachment" "fw_untrust_attach" {
+  count                = length(local.fw_pairs)
+  instance_id          = aws_instance.vmseries[count.index].id
+  network_interface_id = aws_network_interface.fw_untrust_eni[count.index].id
+  device_index         = 1
+}
+
+resource "aws_network_interface_attachment" "fw_trust_attach" {
+  count                = length(local.fw_pairs)
+  instance_id          = aws_instance.vmseries[count.index].id
+  network_interface_id = aws_network_interface.fw_trust_eni[count.index].id
+  device_index         = 2
 }
 
 ########################################
