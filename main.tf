@@ -387,3 +387,35 @@ resource "aws_route_table_association" "app_private_2_assoc" {
   subnet_id      = aws_subnet.app_private_2.id
   route_table_id = aws_route_table.app_private_rt.id
 }
+
+########################
+# Outputs
+########################
+output "route_tables" {
+  value = {
+    mgmt_public = {
+      id   = aws_route_table.mgmt_public_rt.id
+      name = aws_route_table.mgmt_public_rt.tags["Name"]
+    }
+    mgmt_private = {
+      id   = aws_route_table.mgmt_private_rt.id
+      name = aws_route_table.mgmt_private_rt.tags["Name"]
+    }
+    fw_untrust = {
+      id   = aws_route_table.fw_untrust_rt.id
+      name = aws_route_table.fw_untrust_rt.tags["Name"]
+    }
+    fw_trust = {
+      id   = aws_route_table.fw_trust_rt.id
+      name = aws_route_table.fw_trust_rt.tags["Name"]
+    }
+    fw_mgmt = {
+      id   = aws_route_table.fw_mgmt_rt.id
+      name = aws_route_table.fw_mgmt_rt.tags["Name"]
+    }
+    app_private = {
+      id   = aws_route_table.app_private_rt.id
+      name = aws_route_table.app_private_rt.tags["Name"]
+    }
+  }
+}
