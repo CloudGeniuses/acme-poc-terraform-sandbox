@@ -1,5 +1,6 @@
 ########################################
 # AWS Centralized Inspection – HA + Hardening + Audit (Multi-line HCL)
+# Option 1: Create logs bucket automatically (no external bucket lookup)
 ########################################
 
 terraform {
@@ -80,7 +81,7 @@ variable "fw_key_name" {
 
 variable "log_s3_bucket_name" {
   type        = string
-  description = "If set, use this existing S3 bucket for VPC flow logs."
+  description = "Ignored in Option 1 (we create a bucket automatically)."
   default     = null
 }
 
@@ -171,16 +172,7 @@ locals {
       )
   )
 
-  # Choose/create logs bucket name
-  computed_logs_bucket = (
-    var.log_s3_bucket_name != null && var.log_s3_bucket_name != ""
-    ? var.log_s3_bucket_name
-    : "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
-  )
-
-  # Unified effective name
-  logs_bucket_name_effective = local.computed_logs_bucket
-
+  logs_bucket_name = "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
   trail_bucket_name = "${var.name_prefix}-cloudtrail-${random_id.suffix.hex}"
 }
 
@@ -671,47 +663,17 @@ resource "aws_network_interface_attachment" "fw2_attach_trust" {
 }
 
 ########################################
-# S3 – FLOW LOGS (SSE-KMS, VERSIONING, BLOCK PUBLIC, LIFECYCLE, TLS-ONLY)
+# S3 – FLOW LOGS (Create automatically; SSE-KMS, Versioning, Block Public, Lifecycle, TLS-only)
 ########################################
 
-# If no external bucket provided, create one
 resource "aws_s3_bucket" "logs" {
-  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
-  bucket = local.logs_bucket_name_effective
+  count  = var.fw_enable_flow_logs ? 1 : 0
+  bucket = local.logs_bucket_name
   tags   = { Name = "${var.name_prefix}-flowlogs" }
 }
 
-# If using an existing bucket name, look it up to get ARN/ID
-data "aws_s3_bucket" "existing_logs" {
-  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "") ? 1 : 0
-  bucket = var.log_s3_bucket_name
-}
-
-# Convenience locals for bucket ARN/ID, regardless of created vs existing
-locals {
-  logs_bucket_arn = (
-    var.fw_enable_flow_logs
-    ? (
-        (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "")
-        ? data.aws_s3_bucket.existing_logs[0].arn
-        : aws_s3_bucket.logs[0].arn
-      )
-    : null
-  )
-
-  logs_bucket_id = (
-    var.fw_enable_flow_logs
-    ? (
-        (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "")
-        ? data.aws_s3_bucket.existing_logs[0].id
-        : aws_s3_bucket.logs[0].id
-      )
-    : null
-  )
-}
-
 resource "aws_s3_bucket_versioning" "logs" {
-  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
+  count  = length(aws_s3_bucket.logs) > 0 ? 1 : 0
   bucket = aws_s3_bucket.logs[0].id
 
   versioning_configuration {
@@ -720,7 +682,7 @@ resource "aws_s3_bucket_versioning" "logs" {
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
-  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
+  count  = length(aws_s3_bucket.logs) > 0 ? 1 : 0
   bucket = aws_s3_bucket.logs[0].id
 
   rule {
@@ -732,7 +694,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
 }
 
 resource "aws_s3_bucket_public_access_block" "logs" {
-  count                   = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
+  count                   = length(aws_s3_bucket.logs) > 0 ? 1 : 0
   bucket                  = aws_s3_bucket.logs[0].id
   block_public_acls       = true
   block_public_policy     = true
@@ -741,7 +703,7 @@ resource "aws_s3_bucket_public_access_block" "logs" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "logs" {
-  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
+  count  = length(aws_s3_bucket.logs) > 0 ? 1 : 0
   bucket = aws_s3_bucket.logs[0].id
 
   rule {
@@ -765,9 +727,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   }
 }
 
-# TLS-only bucket policy (applies to created or existing bucket)
+# TLS-only bucket policy (deny non-TLS)
 data "aws_iam_policy_document" "logs_tls_only" {
-  count = var.fw_enable_flow_logs ? 1 : 0
+  count = length(aws_s3_bucket.logs) > 0 ? 1 : 0
 
   statement {
     sid     = "DenyInsecureTransport"
@@ -781,8 +743,8 @@ data "aws_iam_policy_document" "logs_tls_only" {
     actions = ["s3:*"]
 
     resources = [
-      local.logs_bucket_arn,
-      "${local.logs_bucket_arn}/*"
+      aws_s3_bucket.logs[0].arn,
+      "${aws_s3_bucket.logs[0].arn}/*"
     ]
 
     condition {
@@ -794,16 +756,16 @@ data "aws_iam_policy_document" "logs_tls_only" {
 }
 
 resource "aws_s3_bucket_policy" "logs" {
-  count  = var.fw_enable_flow_logs ? 1 : 0
-  bucket = local.logs_bucket_id
+  count  = length(data.aws_iam_policy_document.logs_tls_only) > 0 ? 1 : 0
+  bucket = aws_s3_bucket.logs[0].id
   policy = data.aws_iam_policy_document.logs_tls_only[0].json
 }
 
 # VPC Flow Logs -> S3
 resource "aws_flow_log" "fw_vpc_logs" {
-  count                = var.fw_enable_flow_logs ? 1 : 0
+  count                = length(aws_s3_bucket.logs) > 0 ? 1 : 0
   log_destination_type = "s3"
-  log_destination      = local.logs_bucket_arn
+  log_destination      = aws_s3_bucket.logs[0].arn
   traffic_type         = "ALL"
   vpc_id               = aws_vpc.fw_vpc.id
   tags                 = { Name = "${var.name_prefix}-fw-flowlog" }
@@ -1078,7 +1040,7 @@ resource "aws_cloudwatch_metric_alarm" "fw2_eip_unhealthy" {
 # AUDIT – AWS Config, Security Hub, CloudTrail
 ########################################
 
-# AWS Config (recorder + channel)
+# AWS Config (recorder + channel) – deliver to dedicated CloudTrail bucket (always exists)
 resource "aws_iam_role" "config_role" {
   name = "${var.name_prefix}-config-role"
 
@@ -1109,9 +1071,10 @@ resource "aws_config_configuration_recorder" "rec" {
   }
 }
 
+# Use CloudTrail bucket for Config delivery to ensure bucket always exists
 resource "aws_config_delivery_channel" "chan" {
   name           = "default"
-  s3_bucket_name = local.logs_bucket_id
+  s3_bucket_name = aws_s3_bucket.trail.id
   depends_on     = [aws_config_configuration_recorder.rec]
 }
 
@@ -1154,6 +1117,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "trail" {
   }
 }
 
+data "aws_caller_identity" "me_account" {}
+
 data "aws_iam_policy_document" "trail_bucket_policy" {
   statement {
     sid     = "AWSCloudTrailAclCheck"
@@ -1182,7 +1147,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
     actions = ["s3:PutObject"]
 
     resources = [
-      "${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me.account_id}/*"
+      "${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/*"
     ]
 
     condition {
