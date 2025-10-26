@@ -1,5 +1,5 @@
 ########################################
-# AWS Centralized Inspection – HA + Hardening + Audit (Multi-line HCL)
+# AWS Centralized Inspection – HA + GWLB + Hardening + Audit
 # Option 1: Create logs bucket automatically (no external bucket lookup)
 ########################################
 
@@ -107,7 +107,7 @@ variable "region" {
 }
 
 ########################################
-# OPTIONALS (safe defaults; do not need workspace vars)
+# OPTIONALS (safe defaults)
 ########################################
 
 variable "alarm_email" {
@@ -133,6 +133,12 @@ variable "az_primary" {
 variable "az_secondary" {
   type    = string
   default = "b"
+}
+
+variable "use_gwlb" {
+  type        = bool
+  description = "If true, steer traffic via GWLB/GWLBe. If false, use TGW inspection path."
+  default     = true
 }
 
 ########################################
@@ -172,7 +178,7 @@ locals {
       )
   )
 
-  logs_bucket_name = "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
+  logs_bucket_name  = "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
   trail_bucket_name = "${var.name_prefix}-cloudtrail-${random_id.suffix.hex}"
 }
 
@@ -391,6 +397,7 @@ resource "aws_security_group" "vpce_sg" {
   }
 }
 
+# TRUST SG (workload side)
 resource "aws_security_group" "fw_trust_sg" {
   name   = "${var.name_prefix}-fw-trust-sg"
   vpc_id = aws_vpc.fw_vpc.id
@@ -401,6 +408,19 @@ resource "aws_security_group" "fw_trust_sg" {
     protocol    = "-1"
     cidr_blocks = ["10.0.0.0/8"]
   }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# UNTRUST SG (egress-only)
+resource "aws_security_group" "fw_untrust_sg" {
+  name   = "${var.name_prefix}-fw-untrust-sg"
+  vpc_id = aws_vpc.fw_vpc.id
 
   egress {
     from_port   = 0
@@ -543,7 +563,7 @@ resource "aws_network_interface" "fw1_mgmt" {
 
 resource "aws_network_interface" "fw1_untrust" {
   subnet_id         = aws_subnet.fw_untrust_az1.id
-  security_groups   = [aws_security_group.fw_trust_sg.id]
+  security_groups   = [aws_security_group.fw_untrust_sg.id]
   source_dest_check = false
   tags              = { Name = "${var.name_prefix}-fw1-untrust" }
 }
@@ -606,7 +626,7 @@ resource "aws_network_interface" "fw2_mgmt" {
 resource "aws_network_interface" "fw2_untrust" {
   count              = var.enable_ha ? 1 : 0
   subnet_id          = aws_subnet.fw_untrust_az2[0].id
-  security_groups    = [aws_security_group.fw_trust_sg.id]
+  security_groups    = [aws_security_group.fw_untrust_sg.id]
   source_dest_check  = false
   tags               = { Name = "${var.name_prefix}-fw2-untrust" }
 }
@@ -660,6 +680,49 @@ resource "aws_network_interface_attachment" "fw2_attach_trust" {
   instance_id          = aws_instance.fw2_vm[0].id
   network_interface_id = aws_network_interface.fw2_trust[0].id
   device_index         = 2
+}
+
+########################################
+# GATEWAY LOAD BALANCER (GWLB) – SCALE-OUT INLINE INSPECTION
+########################################
+
+resource "aws_lb_target_group" "gwlb_tg" {
+  name        = "${var.name_prefix}-gwlb-tg"
+  port        = 6081
+  protocol    = "GENEVE"
+  vpc_id      = aws_vpc.fw_vpc.id
+  target_type = "ip"
+
+  health_check {
+    protocol = "TCP"
+    port     = "80"
+  }
+
+  tags = { Name = "${var.name_prefix}-gwlb-tg" }
+}
+
+resource "aws_lb_target_group_attachment" "gwlb_tg_fw1" {
+  target_group_arn = aws_lb_target_group.gwlb_tg.arn
+  target_id        = aws_network_interface.fw1_untrust.private_ip
+}
+
+resource "aws_lb_target_group_attachment" "gwlb_tg_fw2" {
+  count            = var.enable_ha ? 1 : 0
+  target_group_arn = aws_lb_target_group.gwlb_tg.arn
+  target_id        = aws_network_interface.fw2_untrust[0].private_ip
+}
+
+resource "aws_lb" "gwlb" {
+  name               = "${var.name_prefix}-gwlb"
+  load_balancer_type = "gateway"
+  subnets            = var.enable_ha ? [aws_subnet.fw_untrust_az1.id, aws_subnet.fw_untrust_az2[0].id] : [aws_subnet.fw_untrust_az1.id]
+  tags               = { Name = "${var.name_prefix}-gwlb" }
+}
+
+resource "aws_vpc_endpoint_service" "gwlb_svc" {
+  acceptance_required        = false
+  gateway_load_balancer_arns = [aws_lb.gwlb.arn]
+  tags                       = { Name = "${var.name_prefix}-gwlb-svc" }
 }
 
 ########################################
@@ -727,7 +790,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   }
 }
 
-# TLS-only bucket policy (deny non-TLS)
 data "aws_iam_policy_document" "logs_tls_only" {
   count = length(aws_s3_bucket.logs) > 0 ? 1 : 0
 
@@ -857,14 +919,37 @@ resource "aws_ec2_transit_gateway_route" "fw_to_app" {
   transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.egress_rt.id
 }
 
-# VPC routes to send traffic to TGW
+########################################
+# GWLBe IN APP VPC + ROUTING (GWLB primary path; TGW fallback)
+########################################
+
+resource "aws_vpc_endpoint" "gwlbe_app" {
+  count             = var.use_gwlb ? 1 : 0
+  vpc_id            = aws_vpc.app_vpc.id
+  service_name      = aws_vpc_endpoint_service.gwlb_svc.service_name
+  vpc_endpoint_type = "GatewayLoadBalancer"
+  subnet_ids        = [aws_subnet.app_private_1.id]
+  tags              = { Name = "${var.name_prefix}-gwlbe-app" }
+}
+
+# Default route to GWLBe when GWLB is enabled
+resource "aws_route" "app_rt_default_to_gwlbe" {
+  count                  = var.use_gwlb ? 1 : 0
+  route_table_id         = aws_route_table.app_rt.id
+  destination_cidr_block = "0.0.0.0/0"
+  vpc_endpoint_id        = aws_vpc_endpoint.gwlbe_app[0].id
+}
+
+# TGW fallback when GWLB disabled
 resource "aws_route" "app_rt_default_to_tgw" {
+  count                  = var.use_gwlb ? 0 : 1
   route_table_id         = aws_route_table.app_rt.id
   destination_cidr_block = "0.0.0.0/0"
   transit_gateway_id     = aws_ec2_transit_gateway.inspection_tgw.id
 }
 
 resource "aws_route" "trust_rt_to_tgw" {
+  count                  = var.use_gwlb ? 0 : 1
   route_table_id         = aws_route_table.trust_rt.id
   destination_cidr_block = "10.0.0.0/8"
   transit_gateway_id     = aws_ec2_transit_gateway.inspection_tgw.id
@@ -1040,7 +1125,7 @@ resource "aws_cloudwatch_metric_alarm" "fw2_eip_unhealthy" {
 # AUDIT – AWS Config, Security Hub, CloudTrail
 ########################################
 
-# AWS Config (recorder + channel) – deliver to dedicated CloudTrail bucket (always exists)
+# AWS Config (recorder + channel)
 resource "aws_iam_role" "config_role" {
   name = "${var.name_prefix}-config-role"
 
