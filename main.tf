@@ -125,12 +125,11 @@ provider "aws" {
 ########################################
 
 # Choose AMI: fw_ami_id then pan_ami_id
+# Enforced again with lifecycle precondition on the instance.
 locals {
   effective_ami = length(var.fw_ami_id) > 0 ? var.fw_ami_id : var.pan_ami_id
-}
 
-# Build user_data from explicit value or S3 bootstrap toggle
-locals {
+  # Build user_data from explicit value or S3 bootstrap toggle
   computed_user_data = (
     var.fw_bootstrap_user_data != null
     ? var.fw_bootstrap_user_data
@@ -143,13 +142,12 @@ locals {
         : null
       )
   )
-}
 
-# Sanitize bucket name if user provided spaces/caps
-locals {
+  # Light “sanitization” without regex: only replace spaces/underscores, lowercase.
+  # (If user leaves it empty, we create a unique bucket below.)
   sanitized_logs_bucket = (
     var.log_s3_bucket_name != null && var.log_s3_bucket_name != ""
-    ? lower(regexreplace(var.log_s3_bucket_name, "[^a-z0-9.-]", "-"))
+    ? lower(replace(replace(var.log_s3_bucket_name, " ", "-"), "_", "-"))
     : null
   )
 }
@@ -474,7 +472,7 @@ resource "aws_network_interface_attachment" "fw_trust_attach" {
 }
 
 ########################################
-# FLOW LOGS + S3 (conditional)
+# FLOW LOGS + S3 (conditional, no regex)
 ########################################
 
 resource "random_id" "suffix" {
