@@ -28,23 +28,23 @@ variable "admin_cidr" {
 }
 
 variable "bootstrap_s3_bucket" {
-  type        = string
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "bootstrap_s3_prefix" {
-  type        = string
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "enable_s3_bootstrap" {
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "environment" {
-  type        = string
-  default     = "sandbox"
+  type    = string
+  default = "sandbox"
 }
 
 variable "fw_ami_id" {
@@ -54,28 +54,28 @@ variable "fw_ami_id" {
 }
 
 variable "fw_bootstrap_user_data" {
-  type        = string
-  default     = null
+  type    = string
+  default = null
 }
 
 variable "fw_desired_capacity" {
-  type        = number
-  default     = 1
+  type    = number
+  default = 1
 }
 
 variable "fw_enable_flow_logs" {
-  type        = bool
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "fw_instance_type" {
-  type        = string
-  default     = "c5.xlarge"
+  type    = string
+  default = "c5.xlarge"
 }
 
 variable "fw_key_name" {
-  type        = string
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "log_s3_bucket_name" {
@@ -85,13 +85,13 @@ variable "log_s3_bucket_name" {
 }
 
 variable "name_prefix" {
-  type        = string
-  default     = "acme-sandbox"
+  type    = string
+  default = "acme-sandbox"
 }
 
 variable "project_name" {
-  type        = string
-  default     = "acme-sandbox"
+  type    = string
+  default = "acme-sandbox"
 }
 
 variable "tgw_id" {
@@ -101,8 +101,8 @@ variable "tgw_id" {
 }
 
 variable "region" {
-  type        = string
-  default     = "us-west-2"
+  type    = string
+  default = "us-west-2"
 }
 
 ########################################
@@ -110,28 +110,28 @@ variable "region" {
 ########################################
 
 variable "alarm_email" {
-  type        = string
-  default     = ""
+  type    = string
+  default = ""
 }
 
 variable "enable_s3_vpc_endpoint" {
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "enable_ha" {
-  type        = bool
-  default     = true
+  type    = bool
+  default = true
 }
 
 variable "az_primary" {
-  type        = string
-  default     = "a"
+  type    = string
+  default = "a"
 }
 
 variable "az_secondary" {
-  type        = string
-  default     = "b"
+  type    = string
+  default = "b"
 }
 
 ########################################
@@ -171,11 +171,15 @@ locals {
       )
   )
 
+  # Choose/create logs bucket name
   computed_logs_bucket = (
     var.log_s3_bucket_name != null && var.log_s3_bucket_name != ""
     ? var.log_s3_bucket_name
     : "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
   )
+
+  # Unified effective name
+  logs_bucket_name_effective = local.computed_logs_bucket
 
   trail_bucket_name = "${var.name_prefix}-cloudtrail-${random_id.suffix.hex}"
 }
@@ -223,13 +227,13 @@ resource "aws_vpc" "fw_vpc" {
   tags                 = { Name = "${var.name_prefix}-fw-vpc" }
 }
 
-# IGW only for UNTRUST (and optionally for bootstrap); mgmt stays private
+# IGW for UNTRUST (mgmt stays private)
 resource "aws_internet_gateway" "fw_igw" {
   vpc_id = aws_vpc.fw_vpc.id
   tags   = { Name = "${var.name_prefix}-fw-igw" }
 }
 
-# MGMT subnets – PRIVATE (no public IPs, no IGW route)
+# MGMT subnets – PRIVATE
 resource "aws_subnet" "fw_mgmt_az1" {
   vpc_id                  = aws_vpc.fw_vpc.id
   cidr_block              = "10.20.0.0/28"
@@ -287,8 +291,7 @@ resource "aws_route_table" "mgmt_rt" {
   tags   = { Name = "${var.name_prefix}-fw-mgmt-rt" }
 }
 
-# NO default route to IGW on mgmt (private). If you want NAT, add NAT GW here.
-
+# NO default route to IGW on mgmt (private)
 resource "aws_route_table_association" "mgmt_assoc_az1" {
   route_table_id = aws_route_table.mgmt_rt.id
   subnet_id      = aws_subnet.fw_mgmt_az1.id
@@ -346,7 +349,6 @@ resource "aws_security_group" "fw_mgmt_sg" {
   name   = "${var.name_prefix}-fw-mgmt-sg"
   vpc_id = aws_vpc.fw_vpc.id
 
-  # Mgmt plane (use SSM primarily; keep 443/22 for emergency via VPN/bastion)
   ingress {
     from_port   = 22
     to_port     = 22
@@ -450,7 +452,7 @@ resource "aws_vpc_endpoint" "ssmmessages" {
   tags                = { Name = "${var.name_prefix}-vpce-ssmmessages" }
 }
 
-# Optional S3 Gateway endpoint for private S3 access (bootstrap/logs)
+# Optional S3 Gateway endpoint (bootstrap/logs privately)
 resource "aws_vpc_endpoint" "s3" {
   count             = var.enable_s3_vpc_endpoint ? 1 : 0
   vpc_id            = aws_vpc.fw_vpc.id
@@ -541,10 +543,10 @@ resource "aws_iam_role_policy_attachment" "attach_s3_read" {
 
 # FW1 (AZ1)
 resource "aws_network_interface" "fw1_mgmt" {
-  subnet_id       = aws_subnet.fw_mgmt_az1.id
-  security_groups = [aws_security_group.fw_mgmt_sg.id]
-  source_dest_check = false
-  tags            = { Name = "${var.name_prefix}-fw1-mgmt" }
+  subnet_id          = aws_subnet.fw_mgmt_az1.id
+  security_groups    = [aws_security_group.fw_mgmt_sg.id]
+  source_dest_check  = false
+  tags               = { Name = "${var.name_prefix}-fw1-mgmt" }
 }
 
 resource "aws_network_interface" "fw1_untrust" {
@@ -602,27 +604,27 @@ resource "aws_network_interface_attachment" "fw1_attach_trust" {
 
 # FW2 (AZ2) when HA enabled
 resource "aws_network_interface" "fw2_mgmt" {
-  count             = var.enable_ha ? 1 : 0
-  subnet_id         = aws_subnet.fw_mgmt_az2[0].id
-  security_groups   = [aws_security_group.fw_mgmt_sg.id]
-  source_dest_check = false
-  tags              = { Name = "${var.name_prefix}-fw2-mgmt" }
+  count              = var.enable_ha ? 1 : 0
+  subnet_id          = aws_subnet.fw_mgmt_az2[0].id
+  security_groups    = [aws_security_group.fw_mgmt_sg.id]
+  source_dest_check  = false
+  tags               = { Name = "${var.name_prefix}-fw2-mgmt" }
 }
 
 resource "aws_network_interface" "fw2_untrust" {
-  count             = var.enable_ha ? 1 : 0
-  subnet_id         = aws_subnet.fw_untrust_az2[0].id
-  security_groups   = [aws_security_group.fw_trust_sg.id]
-  source_dest_check = false
-  tags              = { Name = "${var.name_prefix}-fw2-untrust" }
+  count              = var.enable_ha ? 1 : 0
+  subnet_id          = aws_subnet.fw_untrust_az2[0].id
+  security_groups    = [aws_security_group.fw_trust_sg.id]
+  source_dest_check  = false
+  tags               = { Name = "${var.name_prefix}-fw2-untrust" }
 }
 
 resource "aws_network_interface" "fw2_trust" {
-  count             = var.enable_ha ? 1 : 0
-  subnet_id         = aws_subnet.fw_trust_az2[0].id
-  security_groups   = [aws_security_group.fw_trust_sg.id]
-  source_dest_check = false
-  tags              = { Name = "${var.name_prefix}-fw2-trust" }
+  count              = var.enable_ha ? 1 : 0
+  subnet_id          = aws_subnet.fw_trust_az2[0].id
+  security_groups    = [aws_security_group.fw_trust_sg.id]
+  source_dest_check  = false
+  tags               = { Name = "${var.name_prefix}-fw2-trust" }
 }
 
 resource "aws_eip" "fw2_eip" {
@@ -672,14 +674,44 @@ resource "aws_network_interface_attachment" "fw2_attach_trust" {
 # S3 – FLOW LOGS (SSE-KMS, VERSIONING, BLOCK PUBLIC, LIFECYCLE, TLS-ONLY)
 ########################################
 
+# If no external bucket provided, create one
 resource "aws_s3_bucket" "logs" {
   count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
-  bucket = local.computed_logs_bucket
+  bucket = local.logs_bucket_name_effective
   tags   = { Name = "${var.name_prefix}-flowlogs" }
 }
 
+# If using an existing bucket name, look it up to get ARN/ID
+data "aws_s3_bucket" "existing_logs" {
+  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "") ? 1 : 0
+  bucket = var.log_s3_bucket_name
+}
+
+# Convenience locals for bucket ARN/ID, regardless of created vs existing
+locals {
+  logs_bucket_arn = (
+    var.fw_enable_flow_logs
+    ? (
+        (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "")
+        ? data.aws_s3_bucket.existing_logs[0].arn
+        : aws_s3_bucket.logs[0].arn
+      )
+    : null
+  )
+
+  logs_bucket_id = (
+    var.fw_enable_flow_logs
+    ? (
+        (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "")
+        ? data.aws_s3_bucket.existing_logs[0].id
+        : aws_s3_bucket.logs[0].id
+      )
+    : null
+  )
+}
+
 resource "aws_s3_bucket_versioning" "logs" {
-  count  = length(aws_s3_bucket.logs) > 0 ? 1 : 0
+  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
   bucket = aws_s3_bucket.logs[0].id
 
   versioning_configuration {
@@ -688,7 +720,7 @@ resource "aws_s3_bucket_versioning" "logs" {
 }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
-  count  = length(aws_s3_bucket.logs) > 0 ? 1 : 0
+  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
   bucket = aws_s3_bucket.logs[0].id
 
   rule {
@@ -700,7 +732,7 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
 }
 
 resource "aws_s3_bucket_public_access_block" "logs" {
-  count                   = length(aws_s3_bucket.logs) > 0 ? 1 : 0
+  count                   = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
   bucket                  = aws_s3_bucket.logs[0].id
   block_public_acls       = true
   block_public_policy     = true
@@ -709,7 +741,7 @@ resource "aws_s3_bucket_public_access_block" "logs" {
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "logs" {
-  count  = (var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "")) ? 1 : 0
+  count  = var.fw_enable_flow_logs && (var.log_s3_bucket_name == null || var.log_s3_bucket_name == "") ? 1 : 0
   bucket = aws_s3_bucket.logs[0].id
 
   rule {
@@ -733,9 +765,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "logs" {
   }
 }
 
-# TLS-only bucket policy (deny non-TLS)
+# TLS-only bucket policy (applies to created or existing bucket)
 data "aws_iam_policy_document" "logs_tls_only" {
-  count = length(aws_s3_bucket.logs) > 0 ? 1 : 0
+  count = var.fw_enable_flow_logs ? 1 : 0
 
   statement {
     sid     = "DenyInsecureTransport"
@@ -749,8 +781,8 @@ data "aws_iam_policy_document" "logs_tls_only" {
     actions = ["s3:*"]
 
     resources = [
-      aws_s3_bucket.logs[0].arn,
-      "${aws_s3_bucket.logs[0].arn}/*"
+      local.logs_bucket_arn,
+      "${local.logs_bucket_arn}/*"
     ]
 
     condition {
@@ -762,16 +794,16 @@ data "aws_iam_policy_document" "logs_tls_only" {
 }
 
 resource "aws_s3_bucket_policy" "logs" {
-  count  = length(aws_iam_policy_document.logs_tls_only) > 0 ? 1 : 0
-  bucket = aws_s3_bucket.logs[0].id
-  policy = aws_iam_policy_document.logs_tls_only[0].json
+  count  = var.fw_enable_flow_logs ? 1 : 0
+  bucket = local.logs_bucket_id
+  policy = data.aws_iam_policy_document.logs_tls_only[0].json
 }
 
 # VPC Flow Logs -> S3
 resource "aws_flow_log" "fw_vpc_logs" {
   count                = var.fw_enable_flow_logs ? 1 : 0
   log_destination_type = "s3"
-  log_destination      = (var.log_s3_bucket_name != null && var.log_s3_bucket_name != "") ? "arn:aws:s3:::${var.log_s3_bucket_name}" : aws_s3_bucket.logs[0].arn
+  log_destination      = local.logs_bucket_arn
   traffic_type         = "ALL"
   vpc_id               = aws_vpc.fw_vpc.id
   tags                 = { Name = "${var.name_prefix}-fw-flowlog" }
@@ -1077,10 +1109,9 @@ resource "aws_config_configuration_recorder" "rec" {
   }
 }
 
-# Reuse logs bucket for delivery if created, else disable until provided
 resource "aws_config_delivery_channel" "chan" {
   name           = "default"
-  s3_bucket_name = coalesce(var.log_s3_bucket_name, length(aws_s3_bucket.logs) > 0 ? aws_s3_bucket.logs[0].bucket : null)
+  s3_bucket_name = local.logs_bucket_id
   depends_on     = [aws_config_configuration_recorder.rec]
 }
 
