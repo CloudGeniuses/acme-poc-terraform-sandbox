@@ -1,0 +1,8 @@
+project_name         = "acme-secure-hub"
+environment          = "prod"
+name_prefix          = "acme"
+fw_ami_id            = "ami-0abcd12345example"
+fw_key_name          = "acme-keypair"
+bootstrap_s3_bucket  = "acme-bootstrap-bucket"
+log_s3_bucket_name   = "acme-log-bucket"
+admin_cidr           = "75.155.9.209/32"
