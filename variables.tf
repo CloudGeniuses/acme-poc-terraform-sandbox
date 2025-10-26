@@ -10,37 +10,43 @@ variable "project_name" {
 
 variable "environment" {
   type        = string
-  description = "Environment (dev/prod)"
+  description = "Environment (sandbox/dev/prod)"
 }
 
 variable "name_prefix" {
   type        = string
-  description = "Naming prefix"
+  description = "Prefix for consistent naming"
 }
 
 variable "admin_cidr" {
+  description = "Public IP CIDR allowed for SSH/GUI"
   type        = string
-  description = "CIDR allowed for SSH/GUI"
 }
 
 variable "fw_ami_id" {
-  type        = string
   description = "Palo Alto AMI ID"
+  type        = string
 }
 
 variable "fw_instance_type" {
+  description = "Firewall instance type"
   type        = string
-  default     = "c6i.large"
+  default     = "c5.xlarge"
 }
 
 variable "fw_key_name" {
+  description = "Key pair for management access"
   type        = string
-  description = "SSH key pair name"
+}
+
+variable "fw_enable_flow_logs" {
+  type    = bool
+  default = true
 }
 
 variable "bootstrap_s3_bucket" {
   type        = string
-  description = "S3 bucket for bootstrap"
+  description = "S3 bucket for bootstrap config"
 }
 
 variable "bootstrap_s3_prefix" {
@@ -53,7 +59,14 @@ variable "log_s3_bucket_name" {
   description = "S3 bucket for flow/GWLB logs"
 }
 
-variable "fw_enable_flow_logs" {
-  type    = bool
-  default = true
+variable "enable_s3_bootstrap" {
+  description = "Enable S3-based bootstrap config"
+  type        = bool
+  default     = true
+}
+
+variable "tgw_id" {
+  description = "Optional existing Transit Gateway ID"
+  type        = string
+  default     = ""
 }
