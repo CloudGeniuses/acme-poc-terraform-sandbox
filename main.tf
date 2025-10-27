@@ -191,13 +191,76 @@ resource "random_id" "suffix" {
 }
 
 ########################################
+# CALLER IDENTITIES (used by KMS/bucket policies)
+########################################
+
+data "aws_caller_identity" "me" {}
+data "aws_caller_identity" "me_account" {}
+
+########################################
 # KMS (DEFAULT ENCRYPTION COVERAGE)
 ########################################
+
+# Explicit key policy to allow CloudTrail and AWS Config to use SSE-KMS
+data "aws_iam_policy_document" "kms_key_policy" {
+  statement {
+    sid     = "AllowRootFullAccess"
+    effect  = "Allow"
+    principals { type = "AWS", identifiers = ["arn:aws:iam::${data.aws_caller_identity.me_account.account_id}:root"] }
+    actions  = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid     = "AllowCloudTrailUseOfKMS"
+    effect  = "Allow"
+    principals { type = "Service", identifiers = ["cloudtrail.amazonaws.com"] }
+    actions = [
+      "kms:GenerateDataKey*",
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "kms:EncryptionContext:aws:cloudtrail:arn"
+      values   = ["arn:aws:cloudtrail:*:${data.aws_caller_identity.me_account.account_id}:trail/*"]
+    }
+  }
+
+  statement {
+    sid     = "AllowConfigDeliveryViaS3"
+    effect  = "Allow"
+    principals { type = "Service", identifiers = ["config.amazonaws.com"] }
+    actions = [
+      "kms:GenerateDataKey*",
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:DescribeKey"
+    ]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceAccount"
+      values   = [data.aws_caller_identity.me_account.account_id]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "kms:ViaService"
+      values   = ["s3.${var.region}.amazonaws.com"]
+    }
+  }
+}
 
 resource "aws_kms_key" "default" {
   description             = "${var.name_prefix} default encryption key"
   enable_key_rotation     = true
   deletion_window_in_days = 7
+  policy                  = data.aws_iam_policy_document.kms_key_policy.json
   tags                    = { Name = "${var.name_prefix}-default-kms" }
 }
 
@@ -965,8 +1028,6 @@ resource "aws_sns_topic" "ops_alerts" {
   tags              = { Name = "${var.name_prefix}-ops-alerts" }
 }
 
-data "aws_caller_identity" "me" {}
-
 data "aws_iam_policy_document" "sns_topic_policy" {
   statement {
     effect  = "Allow"
@@ -1141,6 +1202,29 @@ resource "aws_iam_role" "config_role" {
   })
 }
 
+# Inline policy (works in all accounts/partitions)
+data "aws_iam_policy_document" "config_role_inline" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "config:*",
+      "ec2:Describe*",
+      "iam:List*",
+      "iam:Get*",
+      "kms:DescribeKey",
+      "kms:ListAliases"
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "config_inline" {
+  name   = "${var.name_prefix}-config-inline"
+  role   = aws_iam_role.config_role.id
+  policy = data.aws_iam_policy_document.config_role_inline.json
+}
+
+# Keep the managed policy attach; will succeed where available
 resource "aws_iam_role_policy_attachment" "config_role_attach" {
   role       = aws_iam_role.config_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSConfigRole"
@@ -1156,11 +1240,17 @@ resource "aws_config_configuration_recorder" "rec" {
   }
 }
 
-# Use CloudTrail bucket for Config delivery to ensure bucket always exists
+# Use CloudTrail bucket for Config delivery, specify SSE-KMS key + prefix
 resource "aws_config_delivery_channel" "chan" {
   name           = "default"
   s3_bucket_name = aws_s3_bucket.trail.id
-  depends_on     = [aws_config_configuration_recorder.rec]
+  s3_key_prefix  = "AWSLogs/${data.aws_caller_identity.me_account.account_id}/Config"
+  s3_kms_key_arn = aws_kms_key.default.arn
+
+  depends_on = [
+    aws_config_configuration_recorder.rec,
+    aws_s3_bucket_policy.trail
+  ]
 }
 
 resource "aws_config_configuration_recorder_status" "rec_status" {
@@ -1202,39 +1292,43 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "trail" {
   }
 }
 
-data "aws_caller_identity" "me_account" {}
-
+# Bucket policy that permits CloudTrail and AWS Config delivery (with TLS-only)
 data "aws_iam_policy_document" "trail_bucket_policy" {
   statement {
     sid     = "AWSCloudTrailAclCheck"
     effect  = "Allow"
-
-    principals {
-      type        = "Service"
-      identifiers = ["cloudtrail.amazonaws.com"]
-    }
-
-    actions = ["s3:GetBucketAcl"]
-    resources = [
-      aws_s3_bucket.trail.arn
-    ]
+    principals { type = "Service", identifiers = ["cloudtrail.amazonaws.com"] }
+    actions  = ["s3:GetBucketAcl"]
+    resources = [aws_s3_bucket.trail.arn]
   }
 
   statement {
     sid     = "AWSCloudTrailWrite"
     effect  = "Allow"
-
-    principals {
-      type        = "Service"
-      identifiers = ["cloudtrail.amazonaws.com"]
+    principals { type = "Service", identifiers = ["cloudtrail.amazonaws.com"] }
+    actions  = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "s3:x-amz-acl"
+      values   = ["bucket-owner-full-control"]
     }
+  }
 
-    actions = ["s3:PutObject"]
+  statement {
+    sid     = "AWSConfigAclCheck"
+    effect  = "Allow"
+    principals { type = "Service", identifiers = ["config.amazonaws.com"] }
+    actions  = ["s3:GetBucketAcl"]
+    resources = [aws_s3_bucket.trail.arn]
+  }
 
-    resources = [
-      "${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/*"
-    ]
-
+  statement {
+    sid     = "AWSConfigWrite"
+    effect  = "Allow"
+    principals { type = "Service", identifiers = ["config.amazonaws.com"] }
+    actions  = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/Config/*"]
     condition {
       test     = "StringEquals"
       variable = "s3:x-amz-acl"
@@ -1245,19 +1339,12 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
   statement {
     sid     = "DenyInsecureTransport"
     effect  = "Deny"
-
-    principals {
-      type        = "*"
-      identifiers = ["*"]
-    }
-
-    actions = ["s3:*"]
-
+    principals { type = "*", identifiers = ["*"] }
+    actions  = ["s3:*"]
     resources = [
       aws_s3_bucket.trail.arn,
       "${aws_s3_bucket.trail.arn}/*"
     ]
-
     condition {
       test     = "Bool"
       variable = "aws:SecureTransport"
