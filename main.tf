@@ -206,15 +206,25 @@ data "aws_iam_policy_document" "kms_key_policy" {
   statement {
     sid     = "AllowRootFullAccess"
     effect  = "Allow"
-    principals { type = "AWS", identifiers = ["arn:aws:iam::${data.aws_caller_identity.me_account.account_id}:root"] }
-    actions  = ["kms:*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.me_account.account_id}:root"]
+    }
+
+    actions   = ["kms:*"]
     resources = ["*"]
   }
 
   statement {
     sid     = "AllowCloudTrailUseOfKMS"
     effect  = "Allow"
-    principals { type = "Service", identifiers = ["cloudtrail.amazonaws.com"] }
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
     actions = [
       "kms:GenerateDataKey*",
       "kms:Encrypt",
@@ -233,7 +243,12 @@ data "aws_iam_policy_document" "kms_key_policy" {
   statement {
     sid     = "AllowConfigDeliveryViaS3"
     effect  = "Allow"
-    principals { type = "Service", identifiers = ["config.amazonaws.com"] }
+
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+
     actions = [
       "kms:GenerateDataKey*",
       "kms:Encrypt",
@@ -1297,17 +1312,28 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
   statement {
     sid     = "AWSCloudTrailAclCheck"
     effect  = "Allow"
-    principals { type = "Service", identifiers = ["cloudtrail.amazonaws.com"] }
-    actions  = ["s3:GetBucketAcl"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
+    actions   = ["s3:GetBucketAcl"]
     resources = [aws_s3_bucket.trail.arn]
   }
 
   statement {
     sid     = "AWSCloudTrailWrite"
     effect  = "Allow"
-    principals { type = "Service", identifiers = ["cloudtrail.amazonaws.com"] }
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudtrail.amazonaws.com"]
+    }
+
     actions  = ["s3:PutObject"]
     resources = ["${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/*"]
+
     condition {
       test     = "StringEquals"
       variable = "s3:x-amz-acl"
@@ -1318,17 +1344,28 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
   statement {
     sid     = "AWSConfigAclCheck"
     effect  = "Allow"
-    principals { type = "Service", identifiers = ["config.amazonaws.com"] }
-    actions  = ["s3:GetBucketAcl"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+
+    actions   = ["s3:GetBucketAcl"]
     resources = [aws_s3_bucket.trail.arn]
   }
 
   statement {
     sid     = "AWSConfigWrite"
     effect  = "Allow"
-    principals { type = "Service", identifiers = ["config.amazonaws.com"] }
+
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+
     actions  = ["s3:PutObject"]
     resources = ["${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/Config/*"]
+
     condition {
       test     = "StringEquals"
       variable = "s3:x-amz-acl"
@@ -1339,12 +1376,18 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
   statement {
     sid     = "DenyInsecureTransport"
     effect  = "Deny"
-    principals { type = "*", identifiers = ["*"] }
-    actions  = ["s3:*"]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    actions = ["s3:*"]
     resources = [
       aws_s3_bucket.trail.arn,
       "${aws_s3_bucket.trail.arn}/*"
     ]
+
     condition {
       test     = "Bool"
       variable = "aws:SecureTransport"
