@@ -201,7 +201,6 @@ data "aws_caller_identity" "me_account" {}
 # KMS (DEFAULT ENCRYPTION COVERAGE)
 ########################################
 
-# Explicit key policy to allow CloudTrail and AWS Config to use SSE-KMS
 data "aws_iam_policy_document" "kms_key_policy" {
   statement {
     sid     = "AllowRootFullAccess"
@@ -216,6 +215,7 @@ data "aws_iam_policy_document" "kms_key_policy" {
     resources = ["*"]
   }
 
+  # Allow CloudTrail to use the key for SSE-KMS
   statement {
     sid     = "AllowCloudTrailUseOfKMS"
     effect  = "Allow"
@@ -240,6 +240,7 @@ data "aws_iam_policy_document" "kms_key_policy" {
     }
   }
 
+  # Allow AWS Config to deliver via S3 with SSE-KMS
   statement {
     sid     = "AllowConfigDeliveryViaS3"
     effect  = "Allow"
@@ -1217,7 +1218,7 @@ resource "aws_iam_role" "config_role" {
   })
 }
 
-# Inline policy (works in all accounts/partitions)
+# Inline policy (portable)
 data "aws_iam_policy_document" "config_role_inline" {
   statement {
     effect = "Allow"
@@ -1239,8 +1240,9 @@ resource "aws_iam_role_policy" "config_inline" {
   policy = data.aws_iam_policy_document.config_role_inline.json
 }
 
-# Keep the managed policy attach; will succeed where available
+# Managed policy attach disabled (not available/attachable in your env)
 resource "aws_iam_role_policy_attachment" "config_role_attach" {
+  count      = 0
   role       = aws_iam_role.config_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSConfigRole"
 }
@@ -1255,11 +1257,11 @@ resource "aws_config_configuration_recorder" "rec" {
   }
 }
 
-# Use CloudTrail bucket for Config delivery, specify SSE-KMS key + prefix
+# Use CloudTrail bucket for Config delivery, safe prefix + SSE-KMS
 resource "aws_config_delivery_channel" "chan" {
   name           = "default"
   s3_bucket_name = aws_s3_bucket.trail.id
-  s3_key_prefix  = "AWSLogs/${data.aws_caller_identity.me_account.account_id}/Config"
+  s3_key_prefix  = "config"
   s3_kms_key_arn = aws_kms_key.default.arn
 
   depends_on = [
@@ -1307,8 +1309,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "trail" {
   }
 }
 
-# Bucket policy that permits CloudTrail and AWS Config delivery (with TLS-only)
 data "aws_iam_policy_document" "trail_bucket_policy" {
+  # CloudTrail needs GetBucketAcl
   statement {
     sid     = "AWSCloudTrailAclCheck"
     effect  = "Allow"
@@ -1322,6 +1324,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
     resources = [aws_s3_bucket.trail.arn]
   }
 
+  # CloudTrail writes objects with ACL requirement
   statement {
     sid     = "AWSCloudTrailWrite"
     effect  = "Allow"
@@ -1341,6 +1344,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
     }
   }
 
+  # AWS Config needs GetBucketAcl
   statement {
     sid     = "AWSConfigAclCheck"
     effect  = "Allow"
@@ -1354,6 +1358,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
     resources = [aws_s3_bucket.trail.arn]
   }
 
+  # AWS Config writes to the "config/" prefix (no AWSLogs/)
   statement {
     sid     = "AWSConfigWrite"
     effect  = "Allow"
@@ -1364,7 +1369,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
     }
 
     actions  = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/Config/*"]
+    resources = ["${aws_s3_bucket.trail.arn}/config/*"]
 
     condition {
       test     = "StringEquals"
@@ -1373,6 +1378,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
     }
   }
 
+  # Enforce TLS for all callers
   statement {
     sid     = "DenyInsecureTransport"
     effect  = "Deny"
