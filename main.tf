@@ -1,10 +1,10 @@
 ########################################
-# AWS Centralized Inspection – HA + GWLB + Audit
-# Clean Palo (no bootstrap) – 2 AZ
+# AWS Centralized Inspection – HA + GWLB + Audit (CLEAN PAN-OS, no bootstrap)
 ########################################
 
 terraform {
   required_version = ">= 1.6.0, < 2.0.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -57,27 +57,25 @@ variable "enable_ha" {
 }
 
 variable "admin_cidr" {
-  description = "CIDR allowed to originate to mgmt (SSH/HTTPS) if you temporarily open mgmt SG. Keep narrow; default not used because we SSM via bastion."
   type        = string
+  description = "CIDR allowed to originate to mgmt (SSH/HTTPS). Use a narrow office/VPN CIDR."
   default     = "0.0.0.0/0"
 }
 
 variable "fw_ami_id" {
-  description = "Palo Alto VM-Series AMI ID in the region"
   type        = string
-  default     = ""
+  description = "Palo Alto VM-Series AMI ID in the region"
+  default     = "" # <-- REQUIRED: set before apply
 }
 
 variable "fw_instance_type" {
-  description = "Compatible instance type for your VM-Series license/SKU (e.g., c5.xlarge, c5.2xlarge)."
-  type        = string
-  default     = "c5.xlarge"
+  type    = string
+  default = "c5.xlarge" # verify with your licensed SKU
 }
 
 variable "fw_key_name" {
-  description = "Optional keypair (not required for SSM)."
-  type        = string
-  default     = ""
+  type    = string
+  default = "" # optional (SSM bastion used for access)
 }
 
 variable "fw_enable_flow_logs" {
@@ -91,15 +89,20 @@ variable "alarm_email" {
 }
 
 variable "use_gwlb" {
-  description = "If true, app default route goes to GWLBe; TGW is still present for attachment/learning."
   type        = bool
+  description = "If true, steer traffic via GWLB/GWLBe. If false, use TGW inspection path."
   default     = true
 }
 
+variable "enable_s3_vpc_endpoint" {
+  type    = bool
+  default = false
+}
+
+# Optional S3 bootstrap toggles remain (but NO fw_bootstrap_user_data in this clean build)
 variable "enable_s3_bootstrap" {
-  description = "Not used (clean Palo). Leave false."
-  type        = bool
-  default     = false
+  type    = bool
+  default = false
 }
 
 variable "bootstrap_s3_bucket" {
@@ -110,12 +113,6 @@ variable "bootstrap_s3_bucket" {
 variable "bootstrap_s3_prefix" {
   type    = string
   default = ""
-}
-
-variable "enable_s3_vpc_endpoint" {
-  description = "Optionally create S3 gateway VPC endpoint to keep SSM/bootstrap private."
-  type        = bool
-  default     = false
 }
 
 ########################################
@@ -139,16 +136,25 @@ provider "aws" {
 ########################################
 
 locals {
-  az1       = "${var.region}${var.az_primary}"
-  az2       = "${var.region}${var.az_secondary}"
-  user_data = null # clean Palo (no bootstrap)
+  az1 = "${var.region}${var.az_primary}"
+  az2 = "${var.region}${var.az_secondary}"
 
-  logs_bucket_name  = "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
+  # CLEAN by default: only pass user_data if S3 bootstrap explicitly enabled
+  user_data = (
+    var.enable_s3_bootstrap && var.bootstrap_s3_bucket != ""
+    ? <<-EOT
+      vmseries-bootstrap-aws-s3bucket=${var.bootstrap_s3_bucket}
+      vmseries-bootstrap-aws-s3prefix=${var.bootstrap_s3_prefix}
+      EOT
+    : null
+  )
+
   trail_bucket_name = "${var.name_prefix}-cloudtrail-${random_id.suffix.hex}"
+  logs_bucket_name  = "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
 }
 
 ########################################
-# RANDOM + ACCOUNT
+# RANDOM / IDENTITY
 ########################################
 
 resource "random_id" "suffix" {
@@ -159,7 +165,7 @@ data "aws_caller_identity" "me" {}
 data "aws_caller_identity" "me_account" {}
 
 ########################################
-# KMS DEFAULT ENCRYPTION + EBS DEFAULTS
+# KMS (DEFAULT ENCRYPTION COVERAGE)
 ########################################
 
 data "aws_iam_policy_document" "kms_key_policy" {
@@ -171,7 +177,6 @@ data "aws_iam_policy_document" "kms_key_policy" {
       type        = "AWS"
       identifiers = ["arn:aws:iam::${data.aws_caller_identity.me_account.account_id}:root"]
     }
-
     actions   = ["kms:*"]
     resources = ["*"]
   }
@@ -184,14 +189,12 @@ data "aws_iam_policy_document" "kms_key_policy" {
       type        = "Service"
       identifiers = ["cloudtrail.amazonaws.com"]
     }
-
     actions = [
       "kms:GenerateDataKey*",
       "kms:Encrypt",
       "kms:Decrypt",
       "kms:DescribeKey"
     ]
-
     resources = ["*"]
 
     condition {
@@ -209,14 +212,12 @@ data "aws_iam_policy_document" "kms_key_policy" {
       type        = "Service"
       identifiers = ["config.amazonaws.com"]
     }
-
     actions = [
       "kms:GenerateDataKey*",
       "kms:Encrypt",
       "kms:Decrypt",
       "kms:DescribeKey"
     ]
-
     resources = ["*"]
 
     condition {
@@ -238,9 +239,7 @@ resource "aws_kms_key" "default" {
   enable_key_rotation     = true
   deletion_window_in_days = 7
   policy                  = data.aws_iam_policy_document.kms_key_policy.json
-  tags = {
-    Name = "${var.name_prefix}-default-kms"
-  }
+  tags                    = { Name = "${var.name_prefix}-default-kms" }
 }
 
 resource "aws_kms_alias" "default" {
@@ -257,23 +256,19 @@ resource "aws_ebs_default_kms_key" "ebs" {
 }
 
 ########################################
-# FIREWALL VPC (Mgmt / Untrust / Trust)
+# FW VPC (PRIVATE MGMT, UNTRUST, TRUST) – 2 AZs
 ########################################
 
 resource "aws_vpc" "fw_vpc" {
   cidr_block           = "10.20.0.0/24"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags = {
-    Name = "${var.name_prefix}-fw-vpc"
-  }
+  tags                 = { Name = "${var.name_prefix}-fw-vpc" }
 }
 
 resource "aws_internet_gateway" "fw_igw" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name = "${var.name_prefix}-fw-igw"
-  }
+  tags   = { Name = "${var.name_prefix}-fw-igw" }
 }
 
 resource "aws_subnet" "fw_mgmt_az1" {
@@ -281,9 +276,7 @@ resource "aws_subnet" "fw_mgmt_az1" {
   cidr_block              = "10.20.0.0/28"
   availability_zone       = local.az1
   map_public_ip_on_launch = false
-  tags = {
-    Name = "${var.name_prefix}-fw-mgmt-${var.az_primary}"
-  }
+  tags                    = { Name = "${var.name_prefix}-fw-mgmt-${var.az_primary}" }
 }
 
 resource "aws_subnet" "fw_mgmt_az2" {
@@ -292,9 +285,7 @@ resource "aws_subnet" "fw_mgmt_az2" {
   cidr_block              = "10.20.0.16/28"
   availability_zone       = local.az2
   map_public_ip_on_launch = false
-  tags = {
-    Name = "${var.name_prefix}-fw-mgmt-${var.az_secondary}"
-  }
+  tags                    = { Name = "${var.name_prefix}-fw-mgmt-${var.az_secondary}" }
 }
 
 resource "aws_subnet" "fw_untrust_az1" {
@@ -302,9 +293,7 @@ resource "aws_subnet" "fw_untrust_az1" {
   cidr_block              = "10.20.0.32/28"
   availability_zone       = local.az1
   map_public_ip_on_launch = true
-  tags = {
-    Name = "${var.name_prefix}-fw-untrust-${var.az_primary}"
-  }
+  tags                    = { Name = "${var.name_prefix}-fw-untrust-${var.az_primary}" }
 }
 
 resource "aws_subnet" "fw_untrust_az2" {
@@ -313,18 +302,14 @@ resource "aws_subnet" "fw_untrust_az2" {
   cidr_block              = "10.20.0.48/28"
   availability_zone       = local.az2
   map_public_ip_on_launch = true
-  tags = {
-    Name = "${var.name_prefix}-fw-untrust-${var.az_secondary}"
-  }
+  tags                    = { Name = "${var.name_prefix}-fw-untrust-${var.az_secondary}" }
 }
 
 resource "aws_subnet" "fw_trust_az1" {
   vpc_id            = aws_vpc.fw_vpc.id
   cidr_block        = "10.20.0.64/28"
   availability_zone = local.az1
-  tags = {
-    Name = "${var.name_prefix}-fw-trust-${var.az_primary}"
-  }
+  tags              = { Name = "${var.name_prefix}-fw-trust-${var.az_primary}" }
 }
 
 resource "aws_subnet" "fw_trust_az2" {
@@ -332,23 +317,17 @@ resource "aws_subnet" "fw_trust_az2" {
   vpc_id            = aws_vpc.fw_vpc.id
   cidr_block        = "10.20.0.80/28"
   availability_zone = local.az2
-  tags = {
-    Name = "${var.name_prefix}-fw-trust-${var.az_secondary}"
-  }
+  tags              = { Name = "${var.name_prefix}-fw-trust-${var.az_secondary}" }
 }
 
 resource "aws_route_table" "mgmt_rt" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name = "${var.name_prefix}-fw-mgmt-rt"
-  }
+  tags   = { Name = "${var.name_prefix}-fw-mgmt-rt" }
 }
 
 resource "aws_route_table" "untrust_rt" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name = "${var.name_prefix}-fw-untrust-rt"
-  }
+  tags   = { Name = "${var.name_prefix}-fw-untrust-rt" }
 }
 
 resource "aws_route" "untrust_default" {
@@ -359,9 +338,7 @@ resource "aws_route" "untrust_default" {
 
 resource "aws_route_table" "trust_rt" {
   vpc_id = aws_vpc.fw_vpc.id
-  tags = {
-    Name = "${var.name_prefix}-fw-trust-rt"
-  }
+  tags   = { Name = "${var.name_prefix}-fw-trust-rt" }
 }
 
 resource "aws_route_table_association" "mgmt_assoc_az1" {
@@ -375,23 +352,23 @@ resource "aws_route_table_association" "mgmt_assoc_az2" {
   subnet_id      = aws_subnet.fw_mgmt_az2[0].id
 }
 
-resource "aws_route_table_association" "untrust_assoc_az1" {
+resource "aws_route_table_association" "untrust_assoc_1" {
   route_table_id = aws_route_table.untrust_rt.id
   subnet_id      = aws_subnet.fw_untrust_az1.id
 }
 
-resource "aws_route_table_association" "untrust_assoc_az2" {
+resource "aws_route_table_association" "untrust_assoc_2" {
   count          = var.enable_ha ? 1 : 0
   route_table_id = aws_route_table.untrust_rt.id
   subnet_id      = aws_subnet.fw_untrust_az2[0].id
 }
 
-resource "aws_route_table_association" "trust_assoc_az1" {
+resource "aws_route_table_association" "trust_assoc_1" {
   route_table_id = aws_route_table.trust_rt.id
   subnet_id      = aws_subnet.fw_trust_az1.id
 }
 
-resource "aws_route_table_association" "trust_assoc_az2" {
+resource "aws_route_table_association" "trust_assoc_2" {
   count          = var.enable_ha ? 1 : 0
   route_table_id = aws_route_table.trust_rt.id
   subnet_id      = aws_subnet.fw_trust_az2[0].id
@@ -405,16 +382,25 @@ resource "aws_security_group" "fw_mgmt_sg" {
   name   = "${var.name_prefix}-fw-mgmt-sg"
   vpc_id = aws_vpc.fw_vpc.id
 
-  # Mgmt is accessed via SSM bastion → fw_mgmt_sg rules below (443/22)
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_cidr]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_cidr]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.name_prefix}-fw-mgmt-sg"
   }
 }
 
@@ -435,26 +421,17 @@ resource "aws_security_group" "fw_trust_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  tags = {
-    Name = "${var.name_prefix}-fw-trust-sg"
-  }
 }
 
 resource "aws_security_group" "fw_untrust_sg" {
   name   = "${var.name_prefix}-fw-untrust-sg"
   vpc_id = aws_vpc.fw_vpc.id
 
-  # No inbound on untrust by default; EIP health checks can be added via Route53 if needed
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "${var.name_prefix}-fw-untrust-sg"
   }
 }
 
@@ -483,14 +460,10 @@ resource "aws_security_group" "vpce_sg" {
   lifecycle {
     ignore_changes = [ingress]
   }
-
-  tags = {
-    Name = "${var.name_prefix}-vpce-ssm-sg"
-  }
 }
 
 ########################################
-# VPC ENDPOINTS FOR SSM (PRIVATE MGMT)
+# VPC ENDPOINTS FOR SSM (PRIVATE MGMT ACCESS)
 ########################################
 
 resource "aws_vpc_endpoint" "ssm" {
@@ -500,9 +473,7 @@ resource "aws_vpc_endpoint" "ssm" {
   subnet_ids          = var.enable_ha ? [aws_subnet.fw_mgmt_az1.id, aws_subnet.fw_mgmt_az2[0].id] : [aws_subnet.fw_mgmt_az1.id]
   security_group_ids  = [aws_security_group.vpce_sg.id]
   private_dns_enabled = true
-  tags = {
-    Name = "${var.name_prefix}-vpce-ssm"
-  }
+  tags                = { Name = "${var.name_prefix}-vpce-ssm" }
 }
 
 resource "aws_vpc_endpoint" "ec2messages" {
@@ -512,9 +483,7 @@ resource "aws_vpc_endpoint" "ec2messages" {
   subnet_ids          = var.enable_ha ? [aws_subnet.fw_mgmt_az1.id, aws_subnet.fw_mgmt_az2[0].id] : [aws_subnet.fw_mgmt_az1.id]
   security_group_ids  = [aws_security_group.vpce_sg.id]
   private_dns_enabled = true
-  tags = {
-    Name = "${var.name_prefix}-vpce-ec2messages"
-  }
+  tags                = { Name = "${var.name_prefix}-vpce-ec2messages" }
 }
 
 resource "aws_vpc_endpoint" "ssmmessages" {
@@ -524,9 +493,7 @@ resource "aws_vpc_endpoint" "ssmmessages" {
   subnet_ids          = var.enable_ha ? [aws_subnet.fw_mgmt_az1.id, aws_subnet.fw_mgmt_az2[0].id] : [aws_subnet.fw_mgmt_az1.id]
   security_group_ids  = [aws_security_group.vpce_sg.id]
   private_dns_enabled = true
-  tags = {
-    Name = "${var.name_prefix}-vpce-ssmmessages"
-  }
+  tags                = { Name = "${var.name_prefix}-vpce-ssmmessages" }
 }
 
 resource "aws_vpc_endpoint" "s3" {
@@ -534,18 +501,16 @@ resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.fw_vpc.id
   service_name      = "com.amazonaws.${var.region}.s3"
   vpc_endpoint_type = "Gateway"
-  route_table_ids = [
+  route_table_ids   = [
     aws_route_table.mgmt_rt.id,
     aws_route_table.untrust_rt.id,
     aws_route_table.trust_rt.id
   ]
-  tags = {
-    Name = "${var.name_prefix}-s3-endpoint"
-  }
+  tags = { Name = "${var.name_prefix}-s3-endpoint" }
 }
 
 ########################################
-# IAM (EC2 role for PAN – SSM)
+# IAM (SSM + optional bootstrap S3)
 ########################################
 
 data "aws_iam_policy_document" "assume_ec2" {
@@ -568,56 +533,87 @@ resource "aws_iam_role_policy_attachment" "fw_ssm_attach" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# Optional S3 read for bootstrap (no-op if disabled)
+data "aws_iam_policy_document" "s3_read" {
+  count = var.enable_s3_bootstrap && var.bootstrap_s3_bucket != "" ? 1 : 0
+
+  statement {
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::${var.bootstrap_s3_bucket}"]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.bootstrap_s3_prefix}*"]
+    }
+  }
+
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::${var.bootstrap_s3_bucket}/${var.bootstrap_s3_prefix}*"]
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "s3_read_policy" {
+  count  = var.enable_s3_bootstrap && var.bootstrap_s3_bucket != "" ? 1 : 0
+  name   = "${var.name_prefix}-fw-s3-bootstrap-read"
+  policy = data.aws_iam_policy_document.s3_read[0].json
+}
+
+resource "aws_iam_role_policy_attachment" "attach_s3_read" {
+  count      = var.enable_s3_bootstrap && var.bootstrap_s3_bucket != "" ? 1 : 0
+  role       = aws_iam_role.fw_role.name
+  policy_arn = aws_iam_policy.s3_read_policy[0].arn
+}
+
 resource "aws_iam_instance_profile" "fw_profile" {
   name = "${var.name_prefix}-fw-profile"
   role = aws_iam_role.fw_role.name
 }
 
 ########################################
-# FIREWALL ENIs + INSTANCES (HA)
+# FIREWALLS (2× HA) — CLEAN PAN-OS
 ########################################
 
 resource "aws_network_interface" "fw1_mgmt" {
   subnet_id         = aws_subnet.fw_mgmt_az1.id
   security_groups   = [aws_security_group.fw_mgmt_sg.id]
   source_dest_check = false
-  tags = {
-    Name = "${var.name_prefix}-fw1-mgmt"
-  }
+  tags              = { Name = "${var.name_prefix}-fw1-mgmt" }
 }
 
 resource "aws_network_interface" "fw1_untrust" {
   subnet_id         = aws_subnet.fw_untrust_az1.id
   security_groups   = [aws_security_group.fw_untrust_sg.id]
   source_dest_check = false
-  tags = {
-    Name = "${var.name_prefix}-fw1-untrust"
-  }
+  tags              = { Name = "${var.name_prefix}-fw1-untrust" }
 }
 
 resource "aws_network_interface" "fw1_trust" {
   subnet_id         = aws_subnet.fw_trust_az1.id
   security_groups   = [aws_security_group.fw_trust_sg.id]
   source_dest_check = false
-  tags = {
-    Name = "${var.name_prefix}-fw1-trust"
-  }
+  tags              = { Name = "${var.name_prefix}-fw1-trust" }
 }
 
 resource "aws_eip" "fw1_eip" {
   domain            = "vpc"
   network_interface = aws_network_interface.fw1_untrust.id
-  tags = {
-    Name = "${var.name_prefix}-fw1-eip"
-  }
+  tags              = { Name = "${var.name_prefix}-fw1-eip" }
 }
 
 resource "aws_instance" "fw1_vm" {
   ami                  = var.fw_ami_id
   instance_type        = var.fw_instance_type
-  key_name             = var.fw_key_name != "" ? var.fw_key_name : null
+  key_name             = var.fw_key_name
   iam_instance_profile = aws_iam_instance_profile.fw_profile.name
-  user_data            = local.user_data
+  user_data            = local.user_data # null => clean
 
   root_block_device {
     encrypted   = true
@@ -630,15 +626,7 @@ resource "aws_instance" "fw1_vm" {
     network_interface_id = aws_network_interface.fw1_mgmt.id
   }
 
-  tags = {
-    Name = "${var.name_prefix}-fw1-vm"
-  }
-
-  depends_on = [
-    aws_vpc_endpoint.ssm,
-    aws_vpc_endpoint.ec2messages,
-    aws_vpc_endpoint.ssmmessages
-  ]
+  tags = { Name = "${var.name_prefix}-fw1-vm" }
 }
 
 resource "aws_network_interface_attachment" "fw1_attach_untrust" {
@@ -658,9 +646,7 @@ resource "aws_network_interface" "fw2_mgmt" {
   subnet_id         = aws_subnet.fw_mgmt_az2[0].id
   security_groups   = [aws_security_group.fw_mgmt_sg.id]
   source_dest_check = false
-  tags = {
-    Name = "${var.name_prefix}-fw2-mgmt"
-  }
+  tags              = { Name = "${var.name_prefix}-fw2-mgmt" }
 }
 
 resource "aws_network_interface" "fw2_untrust" {
@@ -668,9 +654,7 @@ resource "aws_network_interface" "fw2_untrust" {
   subnet_id         = aws_subnet.fw_untrust_az2[0].id
   security_groups   = [aws_security_group.fw_untrust_sg.id]
   source_dest_check = false
-  tags = {
-    Name = "${var.name_prefix}-fw2-untrust"
-  }
+  tags              = { Name = "${var.name_prefix}-fw2-untrust" }
 }
 
 resource "aws_network_interface" "fw2_trust" {
@@ -678,27 +662,23 @@ resource "aws_network_interface" "fw2_trust" {
   subnet_id         = aws_subnet.fw_trust_az2[0].id
   security_groups   = [aws_security_group.fw_trust_sg.id]
   source_dest_check = false
-  tags = {
-    Name = "${var.name_prefix}-fw2-trust"
-  }
+  tags              = { Name = "${var.name_prefix}-fw2-trust" }
 }
 
 resource "aws_eip" "fw2_eip" {
   count             = var.enable_ha ? 1 : 0
   domain            = "vpc"
   network_interface = aws_network_interface.fw2_untrust[0].id
-  tags = {
-    Name = "${var.name_prefix}-fw2-eip"
-  }
+  tags              = { Name = "${var.name_prefix}-fw2-eip" }
 }
 
 resource "aws_instance" "fw2_vm" {
   count                = var.enable_ha ? 1 : 0
   ami                  = var.fw_ami_id
   instance_type        = var.fw_instance_type
-  key_name             = var.fw_key_name != "" ? var.fw_key_name : null
+  key_name             = var.fw_key_name
   iam_instance_profile = aws_iam_instance_profile.fw_profile.name
-  user_data            = local.user_data
+  user_data            = local.user_data # null => clean
 
   root_block_device {
     encrypted   = true
@@ -711,15 +691,7 @@ resource "aws_instance" "fw2_vm" {
     network_interface_id = aws_network_interface.fw2_mgmt[0].id
   }
 
-  tags = {
-    Name = "${var.name_prefix}-fw2-vm"
-  }
-
-  depends_on = [
-    aws_vpc_endpoint.ssm,
-    aws_vpc_endpoint.ec2messages,
-    aws_vpc_endpoint.ssmmessages
-  ]
+  tags = { Name = "${var.name_prefix}-fw2-vm" }
 }
 
 resource "aws_network_interface_attachment" "fw2_attach_untrust" {
@@ -737,7 +709,7 @@ resource "aws_network_interface_attachment" "fw2_attach_trust" {
 }
 
 ########################################
-# GWLB (GENEVE) + SERVICE
+# GATEWAY LOAD BALANCER (GWLB) – INLINE INSPECTION
 ########################################
 
 resource "aws_lb_target_group" "gwlb_tg" {
@@ -752,9 +724,7 @@ resource "aws_lb_target_group" "gwlb_tg" {
     port     = "80"
   }
 
-  tags = {
-    Name = "${var.name_prefix}-gwlb-tg"
-  }
+  tags = { Name = "${var.name_prefix}-gwlb-tg" }
 }
 
 resource "aws_lb_target_group_attachment" "gwlb_tg_fw1" {
@@ -772,46 +742,54 @@ resource "aws_lb" "gwlb" {
   name               = "${var.name_prefix}-gwlb"
   load_balancer_type = "gateway"
   subnets            = var.enable_ha ? [aws_subnet.fw_untrust_az1.id, aws_subnet.fw_untrust_az2[0].id] : [aws_subnet.fw_untrust_az1.id]
-  tags = {
-    Name = "${var.name_prefix}-gwlb"
-  }
+  tags               = { Name = "${var.name_prefix}-gwlb" }
 }
 
 resource "aws_vpc_endpoint_service" "gwlb_svc" {
   acceptance_required        = false
   gateway_load_balancer_arns = [aws_lb.gwlb.arn]
-  tags = {
-    Name = "${var.name_prefix}-gwlb-svc"
-  }
+  tags                       = { Name = "${var.name_prefix}-gwlb-svc" }
 }
 
 ########################################
-# APP VPC + TGW + ROUTING + GWLBe
+# APP VPC + TGW (Inspection Path)
 ########################################
+
+resource "aws_ec2_transit_gateway" "inspection_tgw" {
+  description                     = "Central Inspection TGW"
+  amazon_side_asn                 = 64512
+  default_route_table_association = "disable"
+  default_route_table_propagation = "disable"
+  tags                            = { Name = "${var.name_prefix}-inspection-tgw" }
+}
+
+resource "aws_ec2_transit_gateway_route_table" "inspection_rt" {
+  transit_gateway_id = aws_ec2_transit_gateway.inspection_tgw.id
+  tags               = { Name = "${var.name_prefix}-inspection-rt" }
+}
+
+resource "aws_ec2_transit_gateway_route_table" "egress_rt" {
+  transit_gateway_id = aws_ec2_transit_gateway.inspection_tgw.id
+  tags               = { Name = "${var.name_prefix}-egress-rt" }
+}
 
 resource "aws_vpc" "app_vpc" {
   cidr_block           = "10.30.0.0/24"
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags = {
-    Name = "${var.name_prefix}-app-vpc"
-  }
+  tags                 = { Name = "${var.name_prefix}-app-vpc" }
 }
 
 resource "aws_subnet" "app_private_1" {
   vpc_id            = aws_vpc.app_vpc.id
   cidr_block        = "10.30.0.0/28"
   availability_zone = local.az1
-  tags = {
-    Name = "${var.name_prefix}-app-private-1"
-  }
+  tags              = { Name = "${var.name_prefix}-app-private-1" }
 }
 
 resource "aws_route_table" "app_rt" {
   vpc_id = aws_vpc.app_vpc.id
-  tags = {
-    Name = "${var.name_prefix}-app-rt"
-  }
+  tags   = { Name = "${var.name_prefix}-app-rt" }
 }
 
 resource "aws_route_table_association" "app_assoc_rt" {
@@ -819,47 +797,19 @@ resource "aws_route_table_association" "app_assoc_rt" {
   subnet_id      = aws_subnet.app_private_1.id
 }
 
-resource "aws_ec2_transit_gateway" "inspection_tgw" {
-  description                     = "Central Inspection TGW"
-  amazon_side_asn                 = 64512
-  default_route_table_association = "disable"
-  default_route_table_propagation = "disable"
-  tags = {
-    Name = "${var.name_prefix}-inspection-tgw"
-  }
-}
-
-resource "aws_ec2_transit_gateway_route_table" "inspection_rt" {
-  transit_gateway_id = aws_ec2_transit_gateway.inspection_tgw.id
-  tags = {
-    Name = "${var.name_prefix}-inspection-rt"
-  }
-}
-
-resource "aws_ec2_transit_gateway_route_table" "egress_rt" {
-  transit_gateway_id = aws_ec2_transit_gateway.inspection_tgw.id
-  tags = {
-    Name = "${var.name_prefix}-egress-rt"
-  }
-}
-
 resource "aws_ec2_transit_gateway_vpc_attachment" "fw_attach" {
   vpc_id                 = aws_vpc.fw_vpc.id
   subnet_ids             = var.enable_ha ? [aws_subnet.fw_trust_az1.id, aws_subnet.fw_trust_az2[0].id] : [aws_subnet.fw_trust_az1.id]
   transit_gateway_id     = aws_ec2_transit_gateway.inspection_tgw.id
   appliance_mode_support = "enable"
-  tags = {
-    Name = "${var.name_prefix}-fw-attach"
-  }
+  tags                   = { Name = "${var.name_prefix}-fw-attach" }
 }
 
 resource "aws_ec2_transit_gateway_vpc_attachment" "app_attach" {
   vpc_id             = aws_vpc.app_vpc.id
   subnet_ids         = [aws_subnet.app_private_1.id]
   transit_gateway_id = aws_ec2_transit_gateway.inspection_tgw.id
-  tags = {
-    Name = "${var.name_prefix}-app-attach"
-  }
+  tags               = { Name = "${var.name_prefix}-app-attach" }
 }
 
 resource "aws_ec2_transit_gateway_route_table_association" "app_assoc" {
@@ -884,16 +834,17 @@ resource "aws_ec2_transit_gateway_route" "fw_to_app" {
   transit_gateway_route_table_id = aws_ec2_transit_gateway_route_table.egress_rt.id
 }
 
-# GWLBe inside App VPC for default egress to GWLB
+########################################
+# GWLBe IN APP VPC + ROUTING (Primary path; TGW fallback)
+########################################
+
 resource "aws_vpc_endpoint" "gwlbe_app" {
   count             = var.use_gwlb ? 1 : 0
   vpc_id            = aws_vpc.app_vpc.id
   service_name      = aws_vpc_endpoint_service.gwlb_svc.service_name
   vpc_endpoint_type = "GatewayLoadBalancer"
   subnet_ids        = [aws_subnet.app_private_1.id]
-  tags = {
-    Name = "${var.name_prefix}-gwlbe-app"
-  }
+  tags              = { Name = "${var.name_prefix}-gwlbe-app" }
 }
 
 resource "aws_route" "app_rt_default_to_gwlbe" {
@@ -918,16 +869,14 @@ resource "aws_route" "trust_rt_to_tgw" {
 }
 
 ########################################
-# LOGGING – Flow Logs (S3/KMS/Versioned)
+# S3 – FLOW LOGS & CLOUDTRAIL (KMS, TLS-only, Versioning)
 ########################################
 
 resource "aws_s3_bucket" "logs" {
   count         = var.fw_enable_flow_logs ? 1 : 0
   bucket        = local.logs_bucket_name
   force_destroy = true
-  tags = {
-    Name = "${var.name_prefix}-flowlogs"
-  }
+  tags          = { Name = "${var.name_prefix}-flowlogs" }
 }
 
 resource "aws_s3_bucket_versioning" "logs" {
@@ -960,32 +909,6 @@ resource "aws_s3_bucket_public_access_block" "logs" {
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "logs" {
-  count  = length(aws_s3_bucket.logs) > 0 ? 1 : 0
-  bucket = aws_s3_bucket.logs[0].id
-
-  rule {
-    id     = "retention"
-    status = "Enabled"
-
-    filter {}
-
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
-    }
-
-    transition {
-      days          = 90
-      storage_class = "GLACIER"
-    }
-
-    expiration {
-      days = 365
-    }
-  }
-}
-
 data "aws_iam_policy_document" "logs_tls_only" {
   count = length(aws_s3_bucket.logs) > 0 ? 1 : 0
 
@@ -999,7 +922,6 @@ data "aws_iam_policy_document" "logs_tls_only" {
     }
 
     actions = ["s3:*"]
-
     resources = [
       aws_s3_bucket.logs[0].arn,
       "${aws_s3_bucket.logs[0].arn}/*"
@@ -1025,21 +947,13 @@ resource "aws_flow_log" "fw_vpc_logs" {
   log_destination      = aws_s3_bucket.logs[0].arn
   traffic_type         = "ALL"
   vpc_id               = aws_vpc.fw_vpc.id
-  tags = {
-    Name = "${var.name_prefix}-fw-flowlog"
-  }
+  tags                 = { Name = "${var.name_prefix}-fw-flowlog" }
 }
-
-########################################
-# AUDIT – CloudTrail + AWS Config
-########################################
 
 resource "aws_s3_bucket" "trail" {
   bucket        = local.trail_bucket_name
   force_destroy = true
-  tags = {
-    Name = "${var.name_prefix}-cloudtrail"
-  }
+  tags          = { Name = "${var.name_prefix}-cloudtrail" }
 }
 
 resource "aws_s3_bucket_public_access_block" "trail" {
@@ -1084,7 +998,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
       identifiers = ["cloudtrail.amazonaws.com"]
     }
 
-    actions  = ["s3:PutObject"]
+    actions   = ["s3:PutObject"]
     resources = ["${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.me_account.account_id}/*"]
 
     condition {
@@ -1116,7 +1030,7 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
       identifiers = ["config.amazonaws.com"]
     }
 
-    actions  = ["s3:PutObject"]
+    actions   = ["s3:PutObject"]
     resources = ["${aws_s3_bucket.trail.arn}/config/*"]
 
     condition {
@@ -1163,18 +1077,182 @@ resource "aws_cloudtrail" "orgtrail" {
   enable_log_file_validation    = true
 }
 
+########################################
+# MONITORING – SNS, Health Checks, Alarms
+########################################
+
+resource "aws_sns_topic" "ops_alerts" {
+  name              = "${var.name_prefix}-ops-alerts"
+  kms_master_key_id = aws_kms_key.default.arn
+  tags              = { Name = "${var.name_prefix}-ops-alerts" }
+}
+
+data "aws_iam_policy_document" "sns_topic_policy" {
+  statement {
+    effect  = "Allow"
+    actions = ["SNS:Publish"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    resources = [aws_sns_topic.ops_alerts.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceAccount"
+      values   = [data.aws_caller_identity.me.account_id]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "ops" {
+  arn    = aws_sns_topic.ops_alerts.arn
+  policy = data.aws_iam_policy_document.sns_topic_policy.json
+}
+
+resource "aws_sns_topic_subscription" "ops_email" {
+  count     = var.alarm_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.ops_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alarm_email
+}
+
+resource "aws_route53_health_check" "fw1_https" {
+  ip_address        = aws_eip.fw1_eip.public_ip
+  type              = "HTTPS"
+  port              = 443
+  resource_path     = "/"
+  request_interval  = 30
+  failure_threshold = 3
+  reference_name    = "${var.name_prefix}-fw1-https"
+}
+
+resource "aws_route53_health_check" "fw2_https" {
+  count             = var.enable_ha ? 1 : 0
+  ip_address        = aws_eip.fw2_eip[0].public_ip
+  type              = "HTTPS"
+  port              = 443
+  resource_path     = "/"
+  request_interval  = 30
+  failure_threshold = 3
+  reference_name    = "${var.name_prefix}-fw2-https"
+}
+
+resource "aws_cloudwatch_metric_alarm" "fw1_cpu_high" {
+  alarm_name          = "${var.name_prefix}-fw1-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    InstanceId = aws_instance.fw1_vm.id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "fw1_status_failed" {
+  alarm_name          = "${var.name_prefix}-fw1-status-check-failed"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    InstanceId = aws_instance.fw1_vm.id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "fw1_eip_unhealthy" {
+  alarm_name          = "${var.name_prefix}-fw1-eip-https-unhealthy"
+  namespace           = "AWS/Route53"
+  metric_name         = "HealthCheckStatus"
+  statistic           = "Minimum"
+  period              = 60
+  evaluation_periods  = 3
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    HealthCheckId = aws_route53_health_check.fw1_https.id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "fw2_cpu_high" {
+  count               = var.enable_ha ? 1 : 0
+  alarm_name          = "${var.name_prefix}-fw2-cpu-high"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 80
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    InstanceId = aws_instance.fw2_vm[0].id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "fw2_status_failed" {
+  count               = var.enable_ha ? 1 : 0
+  alarm_name          = "${var.name_prefix}-fw2-status-check-failed"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    InstanceId = aws_instance.fw2_vm[0].id
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "fw2_eip_unhealthy" {
+  count               = var.enable_ha ? 1 : 0
+  alarm_name          = "${var.name_prefix}-fw2-eip-https-unhealthy"
+  namespace           = "AWS/Route53"
+  metric_name         = "HealthCheckStatus"
+  statistic           = "Minimum"
+  period              = 60
+  evaluation_periods  = 3
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  alarm_actions       = [aws_sns_topic.ops_alerts.arn]
+
+  dimensions = {
+    HealthCheckId = aws_route53_health_check.fw2_https[0].id
+  }
+}
+
+########################################
+# AWS Config & Security Hub
+########################################
+
 resource "aws_iam_role" "config_role" {
   name = "${var.name_prefix}-config-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
-    Statement = [
-      {
-        Effect    = "Allow",
-        Principal = { Service = "config.amazonaws.com" },
-        Action    = "sts:AssumeRole"
-      }
-    ]
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { "Service" = "config.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
   })
 }
 
@@ -1227,10 +1305,6 @@ resource "aws_config_configuration_recorder_status" "rec_status" {
   depends_on = [aws_config_delivery_channel.chan]
 }
 
-########################################
-# SECURITY HUB (optional CIS)
-########################################
-
 resource "aws_securityhub_account" "hub" {}
 
 resource "aws_securityhub_standards_subscription" "cis" {
@@ -1239,9 +1313,10 @@ resource "aws_securityhub_standards_subscription" "cis" {
 }
 
 ########################################
-# SSM BASTION (PRIVATE-ONLY)
+# SSM Bastion for PAN Mgmt (private-only)
 ########################################
 
+# Latest Amazon Linux 2 AMI
 data "aws_ami" "amazon_linux2" {
   most_recent = true
   owners      = ["amazon"]
@@ -1252,12 +1327,13 @@ data "aws_ami" "amazon_linux2" {
   }
 }
 
+# IAM role/profile for SSM Bastion
 resource "aws_iam_role" "ssm_bastion_role" {
   name = "${var.name_prefix}-ssm-bastion-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect   = "Allow",
+      Effect = "Allow",
       Principal = { Service = "ec2.amazonaws.com" },
       Action   = "sts:AssumeRole"
     }]
@@ -1274,11 +1350,11 @@ resource "aws_iam_instance_profile" "ssm_bastion_profile" {
   role = aws_iam_role.ssm_bastion_role.name
 }
 
+# SG: no inbound (SSM only); allow all egress
 resource "aws_security_group" "ssm_bastion_sg" {
   name   = "${var.name_prefix}-ssm-bastion-sg"
   vpc_id = aws_vpc.fw_vpc.id
 
-  # No inbound; SSM only
   egress {
     from_port   = 0
     to_port     = 0
@@ -1286,12 +1362,22 @@ resource "aws_security_group" "ssm_bastion_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = {
-    Name = "${var.name_prefix}-ssm-bastion-sg"
-  }
+  tags = { Name = "${var.name_prefix}-ssm-bastion-sg" }
 }
 
-# Allow bastion → Palo mgmt over HTTPS/SSH
+# Bastion in the mgmt subnet (private IP only)
+resource "aws_instance" "ssm_bastion" {
+  ami                         = data.aws_ami.amazon_linux2.id
+  instance_type               = "t3.micro"
+  subnet_id                   = aws_subnet.fw_mgmt_az1.id
+  iam_instance_profile        = aws_iam_instance_profile.ssm_bastion_profile.name
+  vpc_security_group_ids      = [aws_security_group.ssm_bastion_sg.id]
+  associate_public_ip_address = false
+
+  tags = { Name = "${var.name_prefix}-ssm-bastion" }
+}
+
+# Allow Bastion -> PAN mgmt over HTTPS/SSH (least privilege)
 resource "aws_security_group_rule" "bastion_to_fw_mgmt_https" {
   description              = "Allow bastion to access Palo mgmt over HTTPS (443)"
   type                     = "ingress"
@@ -1312,27 +1398,36 @@ resource "aws_security_group_rule" "bastion_to_fw_mgmt_ssh" {
   source_security_group_id = aws_security_group.ssm_bastion_sg.id
 }
 
-resource "aws_instance" "ssm_bastion" {
-  ami                         = data.aws_ami.amazon_linux2.id
-  instance_type               = "t3.micro"
-  subnet_id                   = aws_subnet.fw_mgmt_az1.id
-  iam_instance_profile        = aws_iam_instance_profile.ssm_bastion_profile.name
-  vpc_security_group_ids      = [aws_security_group.ssm_bastion_sg.id]
-  associate_public_ip_address = false
+########################################
+# Helpful locals/outputs for SSM Port-Forward
+########################################
 
-  tags = {
-    Name = "${var.name_prefix}-ssm-bastion"
-  }
+locals {
+  pan_fw1_mgmt_ip = aws_network_interface.fw1_mgmt.private_ip
+}
 
-  depends_on = [
-    aws_vpc_endpoint.ssm,
-    aws_vpc_endpoint.ec2messages,
-    aws_vpc_endpoint.ssmmessages
-  ]
+output "ssm_bastion_instance_id" {
+  value       = aws_instance.ssm_bastion.id
+  description = "SSM-enabled bastion instance ID"
+}
+
+output "pan_fw1_mgmt_ip" {
+  value       = local.pan_fw1_mgmt_ip
+  description = "Private mgmt IP of PAN fw1"
+}
+
+output "ssm_port_forward_cmd_https" {
+  description = "Run this to open PAN GUI at https://localhost:8443"
+  value       = "aws ssm start-session --target ${aws_instance.ssm_bastion.id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters 'host=[${local.pan_fw1_mgmt_ip}],portNumber=[443],localPortNumber=[8443]'"
+}
+
+output "ssm_port_forward_cmd_ssh" {
+  description = "Run this then: ssh admin@localhost -p 2222"
+  value       = "aws ssm start-session --target ${aws_instance.ssm_bastion.id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters 'host=[${local.pan_fw1_mgmt_ip}],portNumber=[22],localPortNumber=[2222]'"
 }
 
 ########################################
-# OUTPUTS
+# Other Useful Outputs
 ########################################
 
 output "fw1_public_ip" {
@@ -1356,29 +1451,4 @@ output "tgw_route_tables" {
     inspection = aws_ec2_transit_gateway_route_table.inspection_rt.id
     egress     = aws_ec2_transit_gateway_route_table.egress_rt.id
   }
-}
-
-# Helpful SSM port-forward commands (copy/paste)
-locals {
-  pan_fw1_mgmt_ip = aws_network_interface.fw1_mgmt.private_ip
-}
-
-output "ssm_bastion_instance_id" {
-  value       = aws_instance.ssm_bastion.id
-  description = "SSM-enabled bastion instance ID"
-}
-
-output "pan_fw1_mgmt_ip" {
-  value       = local.pan_fw1_mgmt_ip
-  description = "Private mgmt IP of PAN fw1"
-}
-
-output "ssm_port_forward_cmd_https" {
-  description = "Run this to open PAN GUI at https://localhost:8443"
-  value       = "aws ssm start-session --target ${aws_instance.ssm_bastion.id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters 'host=[${local.pan_fw1_mgmt_ip}],portNumber=[443],localPortNumber=[8443]'"
-}
-
-output "ssm_port_forward_cmd_ssh" {
-  description = "Run this then: ssh admin@localhost -p 2222"
-  value       = "aws ssm start-session --target ${aws_instance.ssm_bastion.id} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters 'host=[${local.pan_fw1_mgmt_ip}],portNumber=[22],localPortNumber=[2222]'"
 }
