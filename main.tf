@@ -1,5 +1,5 @@
 ########################################
-# AWS Centralized Inspection – HA + GWLB + Audit (CLEAN PAN-OS, no bootstrap)
+# AWS Centralized Inspection – HA + GWLB + Audit (VM-Series with Cred Bootstrap)
 ########################################
 
 terraform {
@@ -70,7 +70,7 @@ variable "fw_ami_id" {
 
 variable "fw_instance_type" {
   type    = string
-  default = "c5.xlarge" # verify with your licensed SKU
+  default = "c5.xlarge"
 }
 
 variable "fw_key_name" {
@@ -96,23 +96,35 @@ variable "use_gwlb" {
 
 variable "enable_s3_vpc_endpoint" {
   type    = bool
-  default = false
+  default = true # ensure mgmt has private S3 access for bootstrap
 }
 
-# Optional S3 bootstrap toggles remain (but NO fw_bootstrap_user_data in this clean build)
+# --- Bootstrap controls (enabled by default to set admin creds)
 variable "enable_s3_bootstrap" {
   type    = bool
-  default = false
+  default = true
 }
 
 variable "bootstrap_s3_bucket" {
   type    = string
-  default = ""
+  default = "" # if empty, a new bucket will be created
 }
 
 variable "bootstrap_s3_prefix" {
   type    = string
-  default = ""
+  default = "vmseries-bootstrap"
+}
+
+# Day-0 credentials (lab use; cleartext inside bootstrap.xml)
+variable "admin_username" {
+  type    = string
+  default = "admin"
+}
+
+variable "admin_password" {
+  type      = string
+  default   = "Admin2025!"
+  sensitive = true
 }
 
 ########################################
@@ -139,18 +151,18 @@ locals {
   az1 = "${var.region}${var.az_primary}"
   az2 = "${var.region}${var.az_secondary}"
 
-  # CLEAN by default: only pass user_data if S3 bootstrap explicitly enabled
-  user_data = (
-    var.enable_s3_bootstrap && var.bootstrap_s3_bucket != ""
-    ? <<-EOT
-      vmseries-bootstrap-aws-s3bucket=${var.bootstrap_s3_bucket}
-      vmseries-bootstrap-aws-s3prefix=${var.bootstrap_s3_prefix}
-      EOT
-    : null
-  )
-
   trail_bucket_name = "${var.name_prefix}-cloudtrail-${random_id.suffix.hex}"
   logs_bucket_name  = "${var.name_prefix}-flowlogs-${random_id.suffix.hex}"
+
+  # Choose the bootstrap bucket (existing or created)
+  bootstrap_bucket_name = var.bootstrap_s3_bucket != "" ? var.bootstrap_s3_bucket : (var.enable_s3_bootstrap ? aws_s3_bucket.bootstrap[0].id : "")
+
+  # Always pass user_data when bootstrap is enabled (PAN-OS will fetch bootstrap.xml)
+  user_data = var.enable_s3_bootstrap ? <<EOF
+vmseries-bootstrap-aws-s3bucket=${local.bootstrap_bucket_name}
+vmseries-bootstrap-aws-s3prefix=${var.bootstrap_s3_prefix}
+EOF
+  : null
 }
 
 ########################################
@@ -177,6 +189,7 @@ data "aws_iam_policy_document" "kms_key_policy" {
       type        = "AWS"
       identifiers = ["arn:aws:iam::${data.aws_caller_identity.me_account.account_id}:root"]
     }
+
     actions   = ["kms:*"]
     resources = ["*"]
   }
@@ -189,12 +202,14 @@ data "aws_iam_policy_document" "kms_key_policy" {
       type        = "Service"
       identifiers = ["cloudtrail.amazonaws.com"]
     }
+
     actions = [
       "kms:GenerateDataKey*",
       "kms:Encrypt",
       "kms:Decrypt",
       "kms:DescribeKey"
     ]
+
     resources = ["*"]
 
     condition {
@@ -212,12 +227,14 @@ data "aws_iam_policy_document" "kms_key_policy" {
       type        = "Service"
       identifiers = ["config.amazonaws.com"]
     }
+
     actions = [
       "kms:GenerateDataKey*",
       "kms:Encrypt",
       "kms:Decrypt",
       "kms:DescribeKey"
     ]
+
     resources = ["*"]
 
     condition {
@@ -253,6 +270,100 @@ resource "aws_ebs_encryption_by_default" "on" {
 
 resource "aws_ebs_default_kms_key" "ebs" {
   key_arn = aws_kms_key.default.arn
+}
+
+########################################
+# BOOTSTRAP S3 (Only credentials in bootstrap.xml)
+########################################
+
+resource "aws_s3_bucket" "bootstrap" {
+  count         = var.enable_s3_bootstrap && var.bootstrap_s3_bucket == "" ? 1 : 0
+  bucket        = "${var.name_prefix}-bootstrap-${random_id.suffix.hex}"
+  force_destroy = true
+  tags          = { Name = "${var.name_prefix}-bootstrap" }
+}
+
+resource "aws_s3_bucket_public_access_block" "bootstrap" {
+  count                   = length(aws_s3_bucket.bootstrap) > 0 ? 1 : 0
+  bucket                  = aws_s3_bucket.bootstrap[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "bootstrap" {
+  count  = length(aws_s3_bucket.bootstrap) > 0 ? 1 : 0
+  bucket = aws_s3_bucket.bootstrap[0].id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.default.arn
+    }
+  }
+}
+
+data "aws_iam_policy_document" "bootstrap_tls_only" {
+  count = var.enable_s3_bootstrap ? 1 : 0
+
+  statement {
+    sid     = "DenyInsecureTransport"
+    effect  = "Deny"
+    actions = ["s3:*"]
+
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+
+    resources = var.bootstrap_s3_bucket != "" ?
+      ["arn:aws:s3:::${var.bootstrap_s3_bucket}", "arn:aws:s3:::${var.bootstrap_s3_bucket}/*"] :
+      [aws_s3_bucket.bootstrap[0].arn, "${aws_s3_bucket.bootstrap[0].arn}/*"]
+
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
+  }
+}
+
+resource "aws_s3_bucket_policy" "bootstrap" {
+  count  = var.enable_s3_bootstrap ? 1 : 0
+  bucket = local.bootstrap_bucket_name
+  policy = data.aws_iam_policy_document.bootstrap_tls_only[0].json
+}
+
+# Upload bootstrap.xml with admin creds
+resource "aws_s3_object" "bootstrap_xml" {
+  count        = var.enable_s3_bootstrap ? 1 : 0
+  bucket       = local.bootstrap_bucket_name
+  key          = "${var.bootstrap_s3_prefix}/config/bootstrap.xml"
+  content_type = "application/xml"
+  content      = <<EOF
+<config version="11.0.0" urldb="paloaltonetworks">
+  <mgt-config>
+    <users>
+      <entry name="${var.admin_username}">
+        <password>${var.admin_password}</password>
+        <permissions>
+          <role-based>
+            <superuser>yes</superuser>
+          </role-based>
+        </permissions>
+      </entry>
+    </users>
+  </mgt-config>
+</config>
+EOF
+
+  depends_on = [
+    aws_s3_bucket.bootstrap,
+    aws_s3_bucket_server_side_encryption_configuration.bootstrap,
+    aws_s3_bucket_public_access_block.bootstrap,
+    aws_s3_bucket_policy.bootstrap
+  ]
 }
 
 ########################################
@@ -510,12 +621,13 @@ resource "aws_vpc_endpoint" "s3" {
 }
 
 ########################################
-# IAM (SSM + optional bootstrap S3)
+# IAM (SSM + Bootstrap S3 Read)
 ########################################
 
 data "aws_iam_policy_document" "assume_ec2" {
   statement {
     actions = ["sts:AssumeRole"]
+
     principals {
       type        = "Service"
       identifiers = ["ec2.amazonaws.com"]
@@ -533,13 +645,13 @@ resource "aws_iam_role_policy_attachment" "fw_ssm_attach" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Optional S3 read for bootstrap (no-op if disabled)
+# S3 read for bootstrap (kept simple, no fragile SecureTransport condition)
 data "aws_iam_policy_document" "s3_read" {
-  count = var.enable_s3_bootstrap && var.bootstrap_s3_bucket != "" ? 1 : 0
+  count = var.enable_s3_bootstrap ? 1 : 0
 
   statement {
     actions   = ["s3:ListBucket"]
-    resources = ["arn:aws:s3:::${var.bootstrap_s3_bucket}"]
+    resources = ["arn:aws:s3:::${local.bootstrap_bucket_name}"]
 
     condition {
       test     = "StringLike"
@@ -550,24 +662,18 @@ data "aws_iam_policy_document" "s3_read" {
 
   statement {
     actions   = ["s3:GetObject"]
-    resources = ["arn:aws:s3:::${var.bootstrap_s3_bucket}/${var.bootstrap_s3_prefix}*"]
-
-    condition {
-      test     = "Bool"
-      variable = "aws:SecureTransport"
-      values   = ["true"]
-    }
+    resources = ["arn:aws:s3:::${local.bootstrap_bucket_name}/${var.bootstrap_s3_prefix}*"]
   }
 }
 
 resource "aws_iam_policy" "s3_read_policy" {
-  count  = var.enable_s3_bootstrap && var.bootstrap_s3_bucket != "" ? 1 : 0
+  count  = var.enable_s3_bootstrap ? 1 : 0
   name   = "${var.name_prefix}-fw-s3-bootstrap-read"
   policy = data.aws_iam_policy_document.s3_read[0].json
 }
 
 resource "aws_iam_role_policy_attachment" "attach_s3_read" {
-  count      = var.enable_s3_bootstrap && var.bootstrap_s3_bucket != "" ? 1 : 0
+  count      = var.enable_s3_bootstrap ? 1 : 0
   role       = aws_iam_role.fw_role.name
   policy_arn = aws_iam_policy.s3_read_policy[0].arn
 }
@@ -578,7 +684,7 @@ resource "aws_iam_instance_profile" "fw_profile" {
 }
 
 ########################################
-# FIREWALLS (2× HA) — CLEAN PAN-OS
+# FIREWALLS (2× HA-ready instances)
 ########################################
 
 resource "aws_network_interface" "fw1_mgmt" {
@@ -613,7 +719,7 @@ resource "aws_instance" "fw1_vm" {
   instance_type        = var.fw_instance_type
   key_name             = var.fw_key_name
   iam_instance_profile = aws_iam_instance_profile.fw_profile.name
-  user_data            = local.user_data # null => clean
+  user_data            = local.user_data
 
   root_block_device {
     encrypted   = true
@@ -627,6 +733,8 @@ resource "aws_instance" "fw1_vm" {
   }
 
   tags = { Name = "${var.name_prefix}-fw1-vm" }
+
+  depends_on = [aws_s3_object.bootstrap_xml]
 }
 
 resource "aws_network_interface_attachment" "fw1_attach_untrust" {
@@ -678,7 +786,7 @@ resource "aws_instance" "fw2_vm" {
   instance_type        = var.fw_instance_type
   key_name             = var.fw_key_name
   iam_instance_profile = aws_iam_instance_profile.fw_profile.name
-  user_data            = local.user_data # null => clean
+  user_data            = local.user_data
 
   root_block_device {
     encrypted   = true
@@ -692,6 +800,8 @@ resource "aws_instance" "fw2_vm" {
   }
 
   tags = { Name = "${var.name_prefix}-fw2-vm" }
+
+  depends_on = [aws_s3_object.bootstrap_xml]
 }
 
 resource "aws_network_interface_attachment" "fw2_attach_untrust" {
@@ -913,15 +1023,15 @@ data "aws_iam_policy_document" "logs_tls_only" {
   count = length(aws_s3_bucket.logs) > 0 ? 1 : 0
 
   statement {
-    sid    = "DenyInsecureTransport"
-    effect = "Deny"
+    sid     = "DenyInsecureTransport"
+    effect  = "Deny"
+    actions = ["s3:*"]
 
     principals {
       type        = "*"
       identifiers = ["*"]
     }
 
-    actions = ["s3:*"]
     resources = [
       aws_s3_bucket.logs[0].arn,
       "${aws_s3_bucket.logs[0].arn}/*"
@@ -1041,15 +1151,15 @@ data "aws_iam_policy_document" "trail_bucket_policy" {
   }
 
   statement {
-    sid    = "DenyInsecureTransport"
-    effect = "Deny"
+    sid     = "DenyInsecureTransport"
+    effect  = "Deny"
+    actions = ["s3:*"]
 
     principals {
       type        = "*"
       identifiers = ["*"]
     }
 
-    actions = ["s3:*"]
     resources = [
       aws_s3_bucket.trail.arn,
       "${aws_s3_bucket.trail.arn}/*"
@@ -1102,7 +1212,7 @@ data "aws_iam_policy_document" "sns_topic_policy" {
     condition {
       test     = "StringEquals"
       variable = "AWS:SourceAccount"
-      values   = [data.aws_caller_identity.me.account_id]
+      values   = [data.aws_caller_identity.me_account.account_id]
     }
   }
 }
@@ -1302,6 +1412,7 @@ resource "aws_config_delivery_channel" "chan" {
 resource "aws_config_configuration_recorder_status" "rec_status" {
   name       = aws_config_configuration_recorder.rec.name
   is_enabled = true
+
   depends_on = [aws_config_delivery_channel.chan]
 }
 
@@ -1316,7 +1427,6 @@ resource "aws_securityhub_standards_subscription" "cis" {
 # SSM Bastion for PAN Mgmt (private-only)
 ########################################
 
-# Latest Amazon Linux 2 AMI
 data "aws_ami" "amazon_linux2" {
   most_recent = true
   owners      = ["amazon"]
@@ -1327,9 +1437,9 @@ data "aws_ami" "amazon_linux2" {
   }
 }
 
-# IAM role/profile for SSM Bastion
 resource "aws_iam_role" "ssm_bastion_role" {
   name = "${var.name_prefix}-ssm-bastion-role"
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
@@ -1350,7 +1460,6 @@ resource "aws_iam_instance_profile" "ssm_bastion_profile" {
   role = aws_iam_role.ssm_bastion_role.name
 }
 
-# SG: no inbound (SSM only); allow all egress
 resource "aws_security_group" "ssm_bastion_sg" {
   name   = "${var.name_prefix}-ssm-bastion-sg"
   vpc_id = aws_vpc.fw_vpc.id
@@ -1365,7 +1474,6 @@ resource "aws_security_group" "ssm_bastion_sg" {
   tags = { Name = "${var.name_prefix}-ssm-bastion-sg" }
 }
 
-# Bastion in the mgmt subnet (private IP only)
 resource "aws_instance" "ssm_bastion" {
   ami                         = data.aws_ami.amazon_linux2.id
   instance_type               = "t3.micro"
@@ -1377,7 +1485,6 @@ resource "aws_instance" "ssm_bastion" {
   tags = { Name = "${var.name_prefix}-ssm-bastion" }
 }
 
-# Allow Bastion -> PAN mgmt over HTTPS/SSH (least privilege)
 resource "aws_security_group_rule" "bastion_to_fw_mgmt_https" {
   description              = "Allow bastion to access Palo mgmt over HTTPS (443)"
   type                     = "ingress"
